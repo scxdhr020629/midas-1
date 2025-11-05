@@ -99,31 +99,31 @@ class AblationGCNNetmuti(torch.nn.Module):
         # --- [!!! 回退点: 恢复 Sigmoid (因为 train.py 使用 BCELoss) !!!] ---
         self.ac = nn.Sigmoid()
 
-        self._initialize_weights()
+        # self._initialize_weights()
 
-    def _initialize_weights(self):
-        """更稳健的权重初始化"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                # 使用 Kaiming 初始化（针对 LeakyReLU）
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.01)
-                if m.bias is not None:
-                    # 关键：给 bias 一个小正数，防止 LeakyReLU 死亡
-                    nn.init.constant_(m.bias, 0.01)
-
-            elif isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.01)
-
-            elif isinstance(m, nn.Embedding):
-                # Embedding 层使用正态分布初始化
-                nn.init.normal_(m.weight, mean=0, std=0.01)
-
-            elif isinstance(m, nn.LayerNorm):
-                # LayerNorm 保持默认初始化
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+    # def _initialize_weights(self):
+    #     """更稳健的权重初始化"""
+    #     for m in self.modules():
+    #         if isinstance(m, nn.Linear):
+    #             # 使用 Kaiming 初始化（针对 LeakyReLU）
+    #             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.01)
+    #             if m.bias is not None:
+    #                 # 关键：给 bias 一个小正数，防止 LeakyReLU 死亡
+    #                 nn.init.constant_(m.bias, 0.01)
+    #
+    #         elif isinstance(m, nn.Conv1d) or isinstance(m, nn.Conv2d):
+    #             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu', a=0.01)
+    #             if m.bias is not None:
+    #                 nn.init.constant_(m.bias, 0.01)
+    #
+    #         elif isinstance(m, nn.Embedding):
+    #             # Embedding 层使用正态分布初始化
+    #             nn.init.normal_(m.weight, mean=0, std=0.01)
+    #
+    #         elif isinstance(m, nn.LayerNorm):
+    #             # LayerNorm 保持默认初始化
+    #             nn.init.constant_(m.weight, 1)
+    #             nn.init.constant_(m.bias, 0)
 
 
 

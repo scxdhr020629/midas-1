@@ -13,7 +13,7 @@ import os
 import random  # For Python random seed
 
 
-# Define LOG_INTERVAL globally (assuming 45 from your code)
+# Define LOG_INTERVAL globally
 LOG_INTERVAL = 45
 
 # Define loss_fn globally
@@ -30,9 +30,6 @@ def train(model, device, train_loader, optimizer, epoch):
         # 准备好标签
         labels = data.y.view(-1, 1).float().to(device)
 
-        # --- [!!! 关键: 保留 BCELoss 的 Clamp 修复 !!!] ---
-        # (这是我们在切换到 BCEWithLogitsLoss 之前的状态)
-
         # --- 修复 1: 检查模型输出是否有 NaN ---
         if torch.isnan(output).any():
             print(f"\n[!!! 致命错误：模型输出 NaN !!!]")
@@ -44,7 +41,7 @@ def train(model, device, train_loader, optimizer, epoch):
         epsilon = 1e-7  # 定义一个极小值，防止 log(0)
         output_clamped = torch.clamp(output, min=epsilon, max=1.0 - epsilon)
 
-        # --- 修复 3: 检查标签是否越界 (保留这个好习惯) ---
+        # --- 修复 3: 检查标签是否越界 ---
         min_val = labels.min()
         max_val = labels.max()
 
@@ -54,16 +51,11 @@ def train(model, device, train_loader, optimizer, epoch):
             print(f"  标签最小值 (min): {min_val.item()}")
             print(f"  标签最大值 (max): {max_val.item()}")
             print(f"  错误原因: nn.BCELoss (二元交叉熵损失) 要求所有标签值必须在 [0.0, 1.0] 范围内。")
-            print(f"  你的数据中包含了不在这个范围内的值。")
-            print(f"  解决方案: 请检查你的 TestbedDataset 加载器或数据文件，确保所有 y 标签都是 0 或 1。")
             raise ValueError("Labels out of bounds for BCELoss. Check your data.")
 
-        # --- [修改结束] ---
-
-        # 现在 loss_fn 接收的是裁剪过的、安全的 output
-        loss = loss_fn(output_clamped, labels).requires_grad_(True)
+        # 计算损失
+        loss = loss_fn(output_clamped, labels)
         loss.backward()
-        # (在这个时间点，我们还没有添加 clip_grad_norm_)
         optimizer.step()
 
         if batch_idx % LOG_INTERVAL == 0:
@@ -115,16 +107,12 @@ def predicting(model, device, loader):
     return accuracy, precision, recall, f1, roc_auc, pr_auc
 
 
-def accuracy(true_labels, preds):
-    return np.mean(true_labels == preds)
-
-
 modeling = AblationGCNNetmuti  # Use ablation model
 
 model_st = modeling.__name__
 
 cuda_name = "cuda:0"
-if len(sys.argv) > 3:
+if len(sys.argv) > 1:
     cuda_name = "cuda:" + str(int(sys.argv[1]))
 print('cuda_name:', cuda_name)
 
@@ -137,18 +125,16 @@ TEST_BATCH_SIZE = 128
 LR = 0.0001
 NUM_EPOCHS = 50
 NUM_FOLDS = 5  # Number of folds (0 to 4)
-NUM_SEEDS = 5  # Number of seeds
 
 print('Learning rate: ', LR)
 print('Epochs: ', NUM_EPOCHS)
 
-# Define seeds for reproducibility across runs
-# seeds = [42, 100, 200, 300, 400]
-seeds = [400]
-print('\nrunning on ', model_st + '_' + ablation_mode)
+print('\nRunning on ', model_st + '_' + ablation_mode)
 
 # train
 device = torch.device(cuda_name if torch.cuda.is_available() else "cpu")
+print(f'Using device: {device}\n')
+
 accuracies = []
 precisions = []
 recalls = []
@@ -156,37 +142,32 @@ f1_scores = []
 roc_aucs = []
 pr_aucs = []
 
-for seed_idx, seed in enumerate(seeds):
-    # Set seed for this seed's runs (affects model init, DataLoader shuffle, etc.)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    print(f"\n--- Seed {seed} ({seed_idx + 1}/{NUM_SEEDS}) ---")
+for fold in range(NUM_FOLDS):
+    print(f"\n{'='*70}")
+    print(f"Fold {fold + 1}/{NUM_FOLDS}")
+    print(f"{'='*70}")
 
-    for fold in range(NUM_FOLDS):
-        print(f"  Fold {fold}/{NUM_FOLDS - 1}")
+    # Load data for this fold (train{fold}/test{fold})
+    train_data = TestbedDataset(root='data', dataset='train' + str(fold))
+    test_data = TestbedDataset(root='data', dataset='test' + str(fold))
+    train_loader = DataLoader(train_data, batch_size=TRAIN_BATCH_SIZE, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_data, batch_size=TEST_BATCH_SIZE, shuffle=False, drop_last=True)
 
-        # Load data for this fold (train{fold}/test{fold})
-        train_data = TestbedDataset(root='data', dataset='train' + str(fold))
-        test_data = TestbedDataset(root='data', dataset='test' + str(fold))
-        train_loader = DataLoader(train_data, batch_size=TRAIN_BATCH_SIZE, shuffle=True, drop_last=True)
-        test_loader = DataLoader(test_data, batch_size=TEST_BATCH_SIZE, shuffle=False, drop_last=True)
+    model = modeling(ablation_mode=ablation_mode).to(device)  # Pass mode to ablation model
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=0.001)
 
-        model = modeling(ablation_mode=ablation_mode).to(device)  # Pass mode to ablation model
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=0.001)
+    for epoch in range(NUM_EPOCHS):
+        train(model, device, train_loader, optimizer, epoch + 1)
 
-        for epoch in range(NUM_EPOCHS):
-            train(model, device, train_loader, optimizer, epoch + 1)
+    accuracy, precision, recall, f1, roc_auc, pr_auc = predicting(model, device, test_loader)
+    accuracies.append(accuracy)
+    precisions.append(precision)
+    recalls.append(recall)
+    f1_scores.append(f1)
+    roc_aucs.append(roc_auc)
+    pr_aucs.append(pr_auc)
 
-        accuracy, precision, recall, f1, roc_auc, pr_auc = predicting(model, device, test_loader)
-        accuracies.append(accuracy)
-        precisions.append(precision)
-        recalls.append(recall)
-        f1_scores.append(f1)
-        roc_aucs.append(roc_auc)
-        pr_aucs.append(pr_auc)
-
-# average over all seed-fold combinations (25 total)
+# Average over all folds
 avg_accuracy = np.mean(accuracies)
 avg_precision = np.mean(precisions)
 avg_recall = np.mean(recalls)
@@ -202,11 +183,23 @@ std_f1 = np.std(f1_scores)
 std_roc_auc = np.std(roc_aucs)
 std_pr_auc = np.std(pr_aucs)
 
-print("\nAverage Metrics after {} seed-fold combinations ({} seeds x {} folds) for ablation mode '{}':".format(
-    len(accuracies), NUM_SEEDS, NUM_FOLDS, ablation_mode))
-print(f"Accuracy: {avg_accuracy:.4f} ± {std_accuracy:.4f}")
+print("\n" + "="*70)
+print(f"FINAL RESULTS - {NUM_FOLDS}-Fold Cross-Validation")
+print(f"Ablation Mode: '{ablation_mode}'")
+print("="*70)
+print(f"Accuracy:  {avg_accuracy:.4f} ± {std_accuracy:.4f}")
 print(f"Precision: {avg_precision:.4f} ± {std_precision:.4f}")
-print(f"Recall: {avg_recall:.4f} ± {std_recall:.4f}")
-print(f"F1 Score: {avg_f1:.4f} ± {std_f1:.4f}")
-print(f"ROC AUC: {avg_roc_auc:.4f} ± {std_roc_auc:.4f}")
-print(f"PR AUC: {avg_pr_auc:.4f} ± {std_pr_auc:.4f}")
+print(f"Recall:    {avg_recall:.4f} ± {std_recall:.4f}")
+print(f"F1 Score:  {avg_f1:.4f} ± {std_f1:.4f}")
+print(f"ROC AUC:   {avg_roc_auc:.4f} ± {std_roc_auc:.4f}")
+print(f"PR AUC:    {avg_pr_auc:.4f} ± {std_pr_auc:.4f}")
+print("="*70)
+
+# Print individual fold results
+print("\nIndividual Fold Results:")
+print("-"*70)
+for i in range(NUM_FOLDS):
+    print(f"Fold {i+1}: Acc={accuracies[i]:.4f}, Prec={precisions[i]:.4f}, "
+          f"Rec={recalls[i]:.4f}, F1={f1_scores[i]:.4f}, "
+          f"ROC-AUC={roc_aucs[i]:.4f}, PR-AUC={pr_aucs[i]:.4f}")
+print("-"*70)
