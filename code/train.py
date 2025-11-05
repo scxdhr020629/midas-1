@@ -143,8 +143,8 @@ print('Learning rate: ', LR)
 print('Epochs: ', NUM_EPOCHS)
 
 # Define seeds for reproducibility across runs
-seeds = [42, 100, 200, 300, 400]
-
+# seeds = [42, 100, 200, 300, 400]
+seeds = [400]
 print('\nrunning on ', model_st + '_' + ablation_mode)
 
 # train
