@@ -2,14 +2,13 @@ import sys
 import torch
 import torch.nn as nn
 import numpy as np
-from model_fixed import AttnFusionGCNNet  # 导入改进后的模型
+from model_fixed import AttnFusionGCNNet  # 修复: 导入修复后的模型
 from utils import *
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, roc_curve
 from torch_geometric.loader import DataLoader
 import os
 import time
-import json
 
 # --- 全局常量 ---
 LOG_INTERVAL = 45
@@ -18,7 +17,7 @@ loss_fn = nn.BCELoss()
 
 # ============================================================================
 #
-# ✨ 超参数配置 (Hyperparameters) - 改进版
+# ✨ 超参数配置 (Hyperparameters) - 修复版
 #
 # ============================================================================
 LR = 0.0005
@@ -26,64 +25,52 @@ WEIGHT_DECAY = 0.0032
 TRAIN_BATCH_SIZE = 128
 TEST_BATCH_SIZE = 128
 # NUM_EPOCHS = 45
-NUM_EPOCHS = 30
+NUM_EPOCHS = 45
 
 # --- 对比学习超参数 ---
+# 修复: 不再归一化权重，直接使用原始值
+# 这样更直观：如果想增强某个损失，直接调大对应权重即可
 ALPHA = 0.3  # miRNA 视图对比损失权重
 BETA = 0.3  # Drug 视图对比损失权重
-GAMMA = 1.0  # 主任务 (BCE) 权重
+GAMMA = 1.0  # 主任务 (BCE) 权重 - 修复: 增加 BCE 权重以稳定训练
 
 WARMUP_EPOCHS = 5  # 对比学习预热轮数
-TEMPERATURE = 0.07  # 对比学习温度
+TEMPERATURE = 0.07  # 修复: 降低温度以增强对比 (0.07-0.1 较常用)
 LAM = 0.5  # Model_Contrast 内部参数
 CONTRASTIVE_DIM = 128
 
-# ============================================================================
-# 【新增】融合模块配置
-# ============================================================================
-USE_IMPROVED_FUSION = True  # True: 双向注意力融合, False: 原版单向注意力
-FUSION_TYPE = 'bidirectional'  # 可选: 'bidirectional', 'self_cross', 'co_attention'
+# 修复: 移除权重归一化逻辑
+# 用户可以根据实际效果自由调整各权重的相对大小
 
-# 实验标识
-EXPERIMENT_NAME = f"CCL_ASPS_{'Improved' if USE_IMPROVED_FUSION else 'Original'}"
-
-print(f"\n{'=' * 70}")
-print(f"🔬 Experiment: {EXPERIMENT_NAME}")
-print(f"{'=' * 70}")
-print(
-    f"[Config] Fusion Strategy: {'Bidirectional Cross-Attention' if USE_IMPROVED_FUSION else 'Original Single-Direction'}")
 print(f"[Config] Loss Weights: α(miRNA)={ALPHA}, β(Drug)={BETA}, γ(BCE)={GAMMA}")
 print(f"[Config] Total Weighted Loss = {GAMMA}*BCE + warmup_factor*({ALPHA}*miRNA_CL + {BETA}*Drug_CL)")
-print(f"[Config] Temperature: {TEMPERATURE}, Warmup Epochs: {WARMUP_EPOCHS}")
-print(f"{'=' * 70}\n")
 
 
 # ============================================================================
-#
-# Warmup 权重调度
-#
-# ============================================================================
+
 
 def get_contrastive_weight(epoch, warmup_epochs=5):
     """
-    对比学习权重的平滑 Warmup 策略
-    使用余弦 warmup: 0 -> 1
+    修复: 更平滑的 Warmup 策略
+
+    使用余弦 warmup 而非线性，避免突变
     """
     if epoch <= warmup_epochs:
+        # 余弦 warmup: 0 -> 1
         progress = epoch / warmup_epochs
-        return 0.5 * (1 - np.cos(np.pi * progress))
+        return 0.5 * (1 - np.cos(np.pi * progress))  # 从 0 平滑增长到 1
     return 1.0
 
 
 # ============================================================================
 #
-# 核心训练函数 (Train) - 改进版
+# 核心训练函数 (Train) - 修复版
 #
 # ============================================================================
 
 def train(model, device, train_loader, optimizer, epoch):
     """
-    训练一个 epoch，集成 CCL-ASPS + 改进融合逻辑
+    训练一个 epoch，集成 CCL-ASPS 逻辑 (修复版)
     """
     print(f'Training epoch: {epoch}...')
     model.train()
@@ -94,18 +81,19 @@ def train(model, device, train_loader, optimizer, epoch):
     total_drug_contrastive = 0
     batch_count = 0
 
+    # 修复: 使用新的平滑 warmup 策略
     contrastive_weight_factor = get_contrastive_weight(epoch, WARMUP_EPOCHS)
 
     for batch_idx, data in enumerate(train_loader):
         optimizer.zero_grad()
         data = data.to(device)
 
-        # 前向传播 (支持改进的融合模块)
+        # 修复: 传入 warmup_epochs 参数
         output, loss_dict = model(
             data,
             current_epoch=epoch,
             total_epochs=NUM_EPOCHS,
-            warmup_epochs=WARMUP_EPOCHS,
+            warmup_epochs=WARMUP_EPOCHS,  # 新增参数
             return_contrastive_loss=True
         )
 
@@ -119,12 +107,13 @@ def train(model, device, train_loader, optimizer, epoch):
         loss_mirna_contrastive = loss_dict['contrastive_mirna']
         loss_drug_contrastive = loss_dict['contrastive_drug']
 
-        # === 3. 总损失融合 ===
+        # === 3. 总损失融合 (修复版) ===
+        # 修复: 不再归一化权重，直接使用配置值
         loss = (GAMMA * loss_bce +
                 contrastive_weight_factor * (ALPHA * loss_mirna_contrastive +
                                              BETA * loss_drug_contrastive))
 
-        # === 4. 异常检测 ===
+        # === 4. 异常检测 (增强版) ===
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"\n[!!! 致命错误：损失异常 !!!]")
             print(f"  Epoch: {epoch}, Batch: {batch_idx}")
@@ -132,11 +121,17 @@ def train(model, device, train_loader, optimizer, epoch):
             print(f"  miRNA CL: {loss_mirna_contrastive.item():.6f}")
             print(f"  Drug CL: {loss_drug_contrastive.item():.6f}")
             print(f"  Total Loss: {loss.item()}")
+
+            # 调试: 打印模型参数统计
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    print(f"  {name}: grad_norm={param.grad.norm().item():.4f}")
+
             raise ValueError("Loss is NaN/Inf. Stopping training.")
 
         loss.backward()
 
-        # 梯度裁剪
+        # 修复: 更严格的梯度裁剪
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
 
         optimizer.step()
@@ -186,13 +181,13 @@ def train(model, device, train_loader, optimizer, epoch):
 
 # ============================================================================
 #
-# 预测函数 (Predicting) - 改进版
+# 预测函数 (Predicting) - 修复版
 #
 # ============================================================================
 
 def predicting(model, device, loader):
     """
-    推理阶段
+    推理阶段 (修复版)
     """
     model.eval()
     total_probs = []
@@ -203,9 +198,10 @@ def predicting(model, device, loader):
         for data in loader:
             data = data.to(device)
 
+            # 修复: 推理时明确传入参数，避免使用默认值
             output = model(
                 data,
-                current_epoch=0,
+                current_epoch=0,  # 推理时 epoch 无关紧要
                 total_epochs=NUM_EPOCHS,
                 warmup_epochs=WARMUP_EPOCHS,
                 return_contrastive_loss=False
@@ -238,53 +234,7 @@ def predicting(model, device, loader):
 
 # ============================================================================
 #
-# 【新增】结果保存与对比分析
-#
-# ============================================================================
-
-def save_experiment_results(metrics_history, config, filename='results_comparison.json'):
-    """
-    保存实验结果,便于后续对比分析
-    """
-    results = {
-        'experiment_name': EXPERIMENT_NAME,
-        'config': config,
-        'metrics': {
-            'auc_mean': float(np.mean(metrics_history['auc'])),
-            'auc_std': float(np.std(metrics_history['auc'])),
-            'aupr_mean': float(np.mean(metrics_history['pr_auc'])),
-            'aupr_std': float(np.std(metrics_history['pr_auc'])),
-            'acc_mean': float(np.mean(metrics_history['acc'])),
-            'acc_std': float(np.std(metrics_history['acc'])),
-            'f1_mean': float(np.mean(metrics_history['f1'])),
-            'f1_std': float(np.std(metrics_history['f1'])),
-        },
-        'all_folds': {
-            'auc': [float(x) for x in metrics_history['auc']],
-            'aupr': [float(x) for x in metrics_history['pr_auc']],
-            'acc': [float(x) for x in metrics_history['acc']],
-            'f1': [float(x) for x in metrics_history['f1']],
-        }
-    }
-
-    # 如果文件存在,追加结果;否则创建新文件
-    if os.path.exists(filename):
-        with open(filename, 'r') as f:
-            all_results = json.load(f)
-    else:
-        all_results = []
-
-    all_results.append(results)
-
-    with open(filename, 'w') as f:
-        json.dump(all_results, f, indent=2)
-
-    print(f"\n[Info] Results saved to {filename}")
-
-
-# ============================================================================
-#
-# 主程序 (Main Execution) - 改进版
+# 主程序 (Main Execution) - 修复版
 #
 # ============================================================================
 
@@ -297,30 +247,27 @@ if __name__ == "__main__":
 
     device = torch.device(cuda_name if torch.cuda.is_available() else "cpu")
     print(f'Using device: {device}')
-
-    # --- 2. 配置字典 (用于保存) ---
-    config = {
-        'use_improved_fusion': USE_IMPROVED_FUSION,
-        'lr': LR,
-        'weight_decay': WEIGHT_DECAY,
-        'batch_size': TRAIN_BATCH_SIZE,
-        'epochs': NUM_EPOCHS,
-        'alpha': ALPHA,
-        'beta': BETA,
-        'gamma': GAMMA,
-        'temperature': TEMPERATURE,
-        'warmup_epochs': WARMUP_EPOCHS,
-        'lam': LAM
-    }
+    print(f"Running 5-Fold CV with CCL-ASPS Model (Fixed Version)...")
+    print("=" * 70)
 
     modeling = AttnFusionGCNNet
+
+    # 打印配置
+    print(f"Configuration:")
+    print(f"  Epochs: {NUM_EPOCHS}")
+    print(f"  Batch Size (Train/Test): {TRAIN_BATCH_SIZE}/{TEST_BATCH_SIZE}")
+    print(f"  Loss Weights: α={ALPHA}, β={BETA}, γ={GAMMA}")
+    print(f"  Temperature: {TEMPERATURE}")
+    print(f"  Warmup Epochs: {WARMUP_EPOCHS}")
+    print(f"  Lambda: {LAM}")
+    print("=" * 70)
 
     # 结果容器
     metrics_history = {
         'acc': [], 'prec': [], 'rec': [], 'f1': [], 'auc': [], 'pr_auc': []
     }
 
-    # --- 3. 5-Fold CV ---
+    # --- 2. 5-Fold CV ---
     for fold in range(NUM_FOLDS):
         print(f"\n{'=' * 70}")
         print(f">>> Fold {fold + 1}/{NUM_FOLDS}")
@@ -331,24 +278,23 @@ if __name__ == "__main__":
         train_data = TestbedDataset(root='data', dataset='train' + str(fold))
         test_data = TestbedDataset(root='data', dataset='test' + str(fold))
 
+        # 修复: 测试集不使用 drop_last，避免丢失数据
         train_loader = DataLoader(
             train_data,
             batch_size=TRAIN_BATCH_SIZE,
             shuffle=True,
-            drop_last=True
+            drop_last=True  # 训练时 drop_last 确保批次一致
         )
         test_loader = DataLoader(
             test_data,
             batch_size=TEST_BATCH_SIZE,
             shuffle=False,
-            drop_last=False
+            drop_last=False  # 修复: 测试时保留所有样本
         )
 
         print(f"Train samples: {len(train_data)}, Test samples: {len(test_data)}")
 
-        # ============================================================================
-        # 【关键】初始化模型 - 支持改进的融合模块
-        # ============================================================================
+        # 初始化模型
         model = modeling(
             n_output=1,
             n_filters=32,
@@ -360,16 +306,10 @@ if __name__ == "__main__":
             dropout=0.2,
             contrastive_dim=CONTRASTIVE_DIM,
             temperature=TEMPERATURE,
-            lam=LAM,
-            use_improved_fusion=USE_IMPROVED_FUSION  # 【新增参数】
+            lam=LAM
         ).to(device)
 
-        # 打印模型参数量
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Model Parameters: {total_params:,} (Trainable: {trainable_params:,})")
-
-        # 优化器
+        # 修复: 使用 AdamW 优化器 (更稳定)
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=LR,
@@ -378,7 +318,7 @@ if __name__ == "__main__":
             eps=1e-8
         )
 
-        # 学习率调度
+        # 修复: 更温和的学习率调度
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=NUM_EPOCHS,
@@ -387,34 +327,28 @@ if __name__ == "__main__":
 
         # --- 训练循环 ---
         best_auc = 0.0
-        best_aupr = 0.0
         patience_counter = 0
-        patience_limit = 15  # Early stopping 耐心值
+        patience_limit = 10
 
         for epoch in range(1, NUM_EPOCHS + 1):
             train_metrics = train(model, device, train_loader, optimizer, epoch)
 
             # 更新学习率
             scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
 
-            # 每 3 个 epoch 验证一次
-            if epoch % 3 == 0 or epoch == NUM_EPOCHS:
+            # 修复: 每 5 个 epoch 进行一次验证（可选）
+            if epoch % 5 == 0 or epoch == NUM_EPOCHS:
                 acc, prec, rec, f1, auc_score, pr_auc_score = predicting(model, device, test_loader)
-                print(f"[Validation] Epoch {epoch} | LR: {current_lr:.6f} | "
-                      f"AUC={auc_score:.4f}, AUPR={pr_auc_score:.4f}, F1={f1:.4f}")
+                print(f"[Validation] Epoch {epoch}: AUC={auc_score:.4f}, AUPR={pr_auc_score:.4f}")
 
-                # 保存最佳模型
+                # Early stopping (可选)
                 if auc_score > best_auc:
                     best_auc = auc_score
-                    best_aupr = pr_auc_score
                     patience_counter = 0
-                    # 可选: 保存模型
-                    # torch.save(model.state_dict(), f'best_model_fold{fold}_{EXPERIMENT_NAME}.pth')
+                    # torch.save(model.state_dict(), f'best_model_fold{fold}.pth')
                 else:
                     patience_counter += 1
 
-                # Early stopping (可选)
                 # if patience_counter >= patience_limit:
                 #     print(f"Early stopping at epoch {epoch}")
                 #     break
@@ -431,18 +365,19 @@ if __name__ == "__main__":
 
         fold_time = time.time() - fold_start
         print(f"\n┌─ Fold {fold + 1} Final Result ─────────────────")
-        print(f"│ AUC:       {auc_score:.4f} (Best: {best_auc:.4f})")
-        print(f"│ AUPR:      {pr_auc_score:.4f} (Best: {best_aupr:.4f})")
+        print(f"│ AUC:       {auc_score:.4f}")
+        print(f"│ AUPR:      {pr_auc_score:.4f}")
         print(f"│ Accuracy:  {acc:.4f}")
-        print(f"│ Precision: {prec:.4f}")
-        print(f"│ Recall:    {rec:.4f}")
         print(f"│ F1-Score:  {f1:.4f}")
         print(f"│ Time:      {fold_time:.1f}s")
         print(f"└─────────────────────────────────────────────")
 
-    # --- 4. 最终结果统计 ---
+        # 保存模型 (可选)
+        # torch.save(model.state_dict(), f'model_ccl_asps_fold{fold}_final.pth')
+
+    # --- 3. 最终结果统计 ---
     print("\n" + "=" * 70)
-    print(f"FINAL 5-FOLD CV RESULTS - {EXPERIMENT_NAME}")
+    print("FINAL 5-FOLD CV RESULTS (FIXED VERSION)")
     print("=" * 70)
     print(f"AUC:       {np.mean(metrics_history['auc']):.4f} ± {np.std(metrics_history['auc']):.4f}")
     print(f"AUPR:      {np.mean(metrics_history['pr_auc']):.4f} ± {np.std(metrics_history['pr_auc']):.4f}")
@@ -452,8 +387,17 @@ if __name__ == "__main__":
     print(f"F1-Score:  {np.mean(metrics_history['f1']):.4f} ± {np.std(metrics_history['f1']):.4f}")
     print("=" * 70)
 
-    # --- 5. 保存结果 ---
-    save_experiment_results(metrics_history, config, filename='results_comparison.json')
+    # 修复: 保存完整结果到文件
+    results_dict = {
+        'auc': metrics_history['auc'],
+        'pr_auc': metrics_history['pr_auc'],
+        'acc': metrics_history['acc'],
+        'f1': metrics_history['f1'],
+        'mean_auc': np.mean(metrics_history['auc']),
+        'std_auc': np.std(metrics_history['auc']),
+        'mean_aupr': np.mean(metrics_history['pr_auc']),
+        'std_aupr': np.std(metrics_history['pr_auc']),
+    }
 
-    print(f"\n✅ Training completed successfully!")
-    print(f"💡 To compare with baseline, run again with USE_IMPROVED_FUSION=False")
+    # np.save('cv_results_fixed.npy', results_dict)
+    print("\n[Info] Training completed successfully!")

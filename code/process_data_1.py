@@ -101,8 +101,8 @@ proteins = rna['Sequence']
 # Negetive = json.load(open("data/sensitive_Negative_fork2.txt"))
 ass=pd.read_excel('data/resistant_matrix.xlsx', index_col=0)
 
-Positive = json.load(open("data/resistant_Positive_fork2.txt"))
-Negetive = json.load(open("data/resistant_Negative_fork2.txt"))
+Positive = json.load(open("data/resistant_Positive.txt"))
+Negetive = json.load(open("data/resistant_Negative.txt"))
 Potrain_fold=[[] for i in range(5)]
 Netrain_fold=[[] for i in range(5)]
 Povalid_fold=[[] for i in range(5)]
