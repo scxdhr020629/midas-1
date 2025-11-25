@@ -21,9 +21,13 @@ loss_fn = nn.BCELoss()
 #
 # ============================================================================
 LR = 0.0005
+# LR = 0.001
 WEIGHT_DECAY = 0.0032
 TRAIN_BATCH_SIZE = 128
 TEST_BATCH_SIZE = 128
+# TRAIN_BATCH_SIZE = 64
+# TEST_BATCH_SIZE = 64
+
 # NUM_EPOCHS = 45
 NUM_EPOCHS = 45
 
