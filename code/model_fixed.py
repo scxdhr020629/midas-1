@@ -5,65 +5,124 @@ import warnings
 
 
 # ==========================================
-# 1. CCL 核心对比模块 (Model_Contrast) - 修复版
+# 1. CCL 核心对比模块 - 方案一完整版
 # ==========================================
 class Model_Contrast(nn.Module):
-    def __init__(self, hidden_dim, tau, lam):
+    """
+    改进版对比学习模块 - 解决平凡解问题
+
+    关键改进：
+    1. 为每个视图创建独立的投影头（避免共享参数导致的退化）
+    2. 对融合特征使用 stop-gradient（切断平凡解的梯度路径）
+    3. 可选的正交性约束（确保不同视图学习互补特征）
+    """
+
+    def __init__(self, hidden_dim, tau, lam, use_orthogonal_loss=False, ortho_weight=0.01):
         super(Model_Contrast, self).__init__()
-        self.proj = nn.Sequential(
+
+        # ⭐ 关键修改：为每个视图创建独立的投影头
+        self.proj_view1 = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+
+        self.proj_view2 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        self.proj_fused = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
         self.tau = tau
         self.lam = lam
-        # 初始化权重
-        for model in self.proj:
-            if isinstance(model, nn.Linear):
-                nn.init.xavier_normal_(model.weight, gain=1.414)
+        self.use_orthogonal_loss = use_orthogonal_loss
+        self.ortho_weight = ortho_weight
+
+        # 初始化所有投影头的权重
+        for proj in [self.proj_view1, self.proj_view2, self.proj_fused]:
+            for layer in proj:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_normal_(layer.weight, gain=1.414)
 
     def sim(self, z1, z2):
-        """计算余弦相似度矩阵"""
+        """计算余弦相似度矩阵并应用温度缩放"""
         z1_norm = torch.norm(z1, dim=-1, keepdim=True)
         z2_norm = torch.norm(z2, dim=-1, keepdim=True)
         dot_numerator = torch.mm(z1, z2.t())
         dot_denominator = torch.mm(z1_norm, z2_norm.t())
 
-        # 修复: 先计算余弦相似度，再除以温度，最后 exp
         cos_sim = dot_numerator / (dot_denominator + 1e-8)
         sim_matrix = torch.exp(cos_sim / self.tau)
         return sim_matrix
 
-    def forward(self, v1_embs, v2_embs, pos=None, neg=None):
+    def orthogonal_loss(self, v1_proj, v2_proj):
         """
-        修复: InfoNCE 损失应该按样本计算，而不是全局求和
+        正交性约束：确保两个视图学习互补的特征
+        通过最小化它们的余弦相似度来实现
+        """
+        v1_norm = F.normalize(v1_proj, dim=-1)
+        v2_norm = F.normalize(v2_proj, dim=-1)
+
+        # 计算批内样本的平均余弦相似度
+        similarity = (v1_norm * v2_norm).sum(dim=-1).abs().mean()
+
+        return similarity
+
+    def forward(self, v1_embs, v2_embs, fused_embs, pos=None, neg=None):
+        """
+        前向传播 - 修复平凡解问题
 
         Args:
-            v1_embs: View 1 embeddings [batch_size, hidden_dim]
-            v2_embs: View 2 embeddings [batch_size, hidden_dim]
+            v1_embs: View 1 embeddings [batch_size, hidden_dim] (e.g., Seq)
+            v2_embs: View 2 embeddings [batch_size, hidden_dim] (e.g., Mol)
+            fused_embs: Fused embeddings [batch_size, hidden_dim] (contains residual)
             pos: Positive mask [batch_size, batch_size]
             neg: Negative mask [batch_size, batch_size]
+
+        Returns:
+            total_loss: 对比学习总损失
         """
-        v1_embs = self.proj(v1_embs)
-        v2_embs = self.proj(v2_embs)
+        # ⭐ 关键修改1：使用独立的投影头
+        v1_proj = self.proj_view1(v1_embs)
+        v2_proj = self.proj_view2(v2_embs)
 
-        # 计算相似度矩阵
-        matrix_1to2 = self.sim(v1_embs, v2_embs)
+        # ⭐ 关键修改2：对融合特征使用 detach() 切断梯度
+        # 这防止了模型通过让融合特征退化为某个视图来获得低损失
+        fused_detached = fused_embs.detach()
+        fused_proj = self.proj_fused(fused_detached)
 
-        # 应用掩码: 正样本和负样本的相似度
-        pos_sim = (matrix_1to2 * pos).sum(dim=1)  # [batch_size]
-        neg_sim = (matrix_1to2 * neg).sum(dim=1)  # [batch_size]
+        # ========== View 1 与 Fused 的对比损失 ==========
+        matrix_v1_to_fused = self.sim(v1_proj, fused_proj)
+        pos_sim_v1 = (matrix_v1_to_fused * pos).sum(dim=1)
+        neg_sim_v1 = (matrix_v1_to_fused * neg).sum(dim=1)
+        loss_v1 = -torch.log(pos_sim_v1 / (pos_sim_v1 + neg_sim_v1 + 1e-8) + 1e-8)
 
-        # 修复: 按样本计算 InfoNCE 损失
-        # Loss = -log(exp(pos) / (exp(pos) + exp(neg)))
-        #      = -log(pos / (pos + neg))
-        loss = -torch.log(pos_sim / (pos_sim + neg_sim + 1e-8) + 1e-8)
+        # ========== View 2 与 Fused 的对比损失 ==========
+        matrix_v2_to_fused = self.sim(v2_proj, fused_proj)
+        pos_sim_v2 = (matrix_v2_to_fused * pos).sum(dim=1)
+        neg_sim_v2 = (matrix_v2_to_fused * neg).sum(dim=1)
+        loss_v2 = -torch.log(pos_sim_v2 / (pos_sim_v2 + neg_sim_v2 + 1e-8) + 1e-8)
 
-        return loss.mean()
+        # ========== 基础对比损失 ==========
+        contrastive_loss = loss_v1.mean() + loss_v2.mean()
+
+        # ========== 可选：正交性约束 ==========
+        if self.use_orthogonal_loss:
+            ortho_loss = self.orthogonal_loss(v1_proj, v2_proj)
+            total_loss = contrastive_loss + self.ortho_weight * ortho_loss
+            return total_loss
+
+        return contrastive_loss
 
 
 # ==========================================
-# 2. ASPS 动态采样策略 (修复版)
+# 2. ASPS 动态采样策略 (保持不变)
 # ==========================================
 def get_contrast_pair_batch(args, feat_sim, device):
     """
@@ -80,7 +139,7 @@ def get_contrast_pair_batch(args, feat_sim, device):
     current_epoch = args.current_epoch if hasattr(args, 'current_epoch') else args['current_epoch']
     total_epoch = args.epochs if hasattr(args, 'epochs') else args['epochs']
     beta = args.beta if hasattr(args, 'beta') else 0.5
-    warmup_epochs = args.get('warmup_epochs', 5)  # 新增: 支持 warmup 参数
+    warmup_epochs = args.get('warmup_epochs', 5)
 
     # 1. 基础正样本 (Positive): 对角线
     pos = torch.eye(batch_size).to(device)
@@ -88,25 +147,24 @@ def get_contrast_pair_batch(args, feat_sim, device):
     # 2. 基础负样本 (Negative): 所有非对角线
     neg_all = torch.ones_like(pos) - pos
 
-    # 3. 修复: ASPS 动态采样策略
+    # 3. ASPS 动态采样策略
     max_neg_num = batch_size - 1
 
-    # 修复: 在 Warmup 期间不进行硬负样本挖掘
+    # 在 Warmup 期间不进行硬负样本挖掘
     if current_epoch <= warmup_epochs:
-        # Warmup 阶段: 使用所有负样本
         neg = neg_all
     else:
-        # 修复: 计算相对于 warmup 后的进度
+        # 计算相对于 warmup 后的进度
         progress = (current_epoch - warmup_epochs) / (total_epoch - warmup_epochs)
-        progress = max(0.0, min(1.0, progress))  # 限制在 [0, 1]
+        progress = max(0.0, min(1.0, progress))
 
-        # 修复: 使用二次增长，早期温和增加
+        # 使用二次增长，早期温和增加
         k_neg = int(max_neg_num * (progress ** 1.5) * beta)
-        k_neg = max(1, min(k_neg, max_neg_num))  # 限制在 [1, max_neg_num]
+        k_neg = max(1, min(k_neg, max_neg_num))
 
         # 利用特征相似度挖掘困难样本
         feat_sim_masked = feat_sim.clone()
-        feat_sim_masked.fill_diagonal_(-9e15)  # 排除自己
+        feat_sim_masked.fill_diagonal_(-9e15)
 
         # 选出相似度最高的 K 个作为 "Hard Negatives"
         vals, indices = feat_sim_masked.topk(k=k_neg, dim=1, largest=True)
@@ -114,10 +172,8 @@ def get_contrast_pair_batch(args, feat_sim, device):
         hard_neg_mask = torch.zeros_like(feat_sim).to(device)
         hard_neg_mask.scatter_(1, indices, 1)
 
-        # 修复: 渐进式混合策略
-        # 早期: 主要用全部负样本
-        # 后期: 逐渐增加困难负样本权重
-        alpha = min(progress * 2, 1.0)  # 0 -> 1 的权重
+        # 渐进式混合策略
+        alpha = min(progress * 2, 1.0)
         neg = alpha * hard_neg_mask + (1 - alpha) * neg_all
 
     # 确保正负不重叠
@@ -127,12 +183,20 @@ def get_contrast_pair_batch(args, feat_sim, device):
 
 
 # ==========================================
-# 3. 主模型 (AttnFusionGCNNet) - 修复版
+# 3. 主模型 (AttnFusionGCNNet) - 完整修复版
 # ==========================================
 class AttnFusionGCNNet(torch.nn.Module):
     def __init__(self, n_output=1, n_filters=32, embed_dim=64, num_features_xd=78,
                  num_features_smile=66, num_features_xt=25, output_dim=128, dropout=0.2,
-                 contrastive_dim=128, temperature=0.1, lam=0.5):
+                 contrastive_dim=128, temperature=0.1, lam=0.5,
+                 use_orthogonal_loss=False, ortho_weight=0.01):
+        """
+        初始化模型
+
+        新增参数:
+            use_orthogonal_loss: 是否使用正交性约束
+            ortho_weight: 正交性损失权重
+        """
         super(AttnFusionGCNNet, self).__init__()
 
         self.n_output = n_output
@@ -203,9 +267,21 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.mirna_attn = nn.MultiheadAttention(embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.05)
         self.layer_norm_mirna = nn.LayerNorm(output_dim, eps=1e-3)
 
-        # ============ 对比学习模块 (修复版) ============
-        self.contrast_drug = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
-        self.contrast_mirna = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
+        # ============ ⭐ 对比学习模块 (方案一修复版) ============
+        self.contrast_drug = Model_Contrast(
+            hidden_dim=output_dim,
+            tau=temperature,
+            lam=lam,
+            use_orthogonal_loss=use_orthogonal_loss,
+            ortho_weight=ortho_weight
+        )
+        self.contrast_mirna = Model_Contrast(
+            hidden_dim=output_dim,
+            tau=temperature,
+            lam=lam,
+            use_orthogonal_loss=use_orthogonal_loss,
+            ortho_weight=ortho_weight
+        )
 
         # Final layers
         self.fc1 = nn.Linear(output_dim * 2, 256)
@@ -214,17 +290,25 @@ class AttnFusionGCNNet(torch.nn.Module):
 
     def process_drug_fingerprints(self, rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint):
         """Process drug fingerprint features with self-attention"""
-        if len(rdkit_descriptor.shape) == 1: rdkit_descriptor = rdkit_descriptor.unsqueeze(0)
-        if len(rdkit_fingerprint.shape) == 1: rdkit_fingerprint = rdkit_fingerprint.unsqueeze(0)
-        if len(maccs_fingerprint.shape) == 1: maccs_fingerprint = maccs_fingerprint.unsqueeze(0)
-        if len(morgan_fingerprint.shape) == 1: morgan_fingerprint = morgan_fingerprint.unsqueeze(0)
+        if len(rdkit_descriptor.shape) == 1:
+            rdkit_descriptor = rdkit_descriptor.unsqueeze(0)
+        if len(rdkit_fingerprint.shape) == 1:
+            rdkit_fingerprint = rdkit_fingerprint.unsqueeze(0)
+        if len(maccs_fingerprint.shape) == 1:
+            maccs_fingerprint = maccs_fingerprint.unsqueeze(0)
+        if len(morgan_fingerprint.shape) == 1:
+            morgan_fingerprint = morgan_fingerprint.unsqueeze(0)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
-            if len(rdkit_descriptor.shape) > 2: rdkit_descriptor = rdkit_descriptor.mean(dim=1)
-            if len(rdkit_fingerprint.shape) > 2: rdkit_fingerprint = rdkit_fingerprint.mean(dim=1)
-            if len(maccs_fingerprint.shape) > 2: maccs_fingerprint = maccs_fingerprint.mean(dim=1)
-            if len(morgan_fingerprint.shape) > 2: morgan_fingerprint = morgan_fingerprint.mean(dim=1)
+            if len(rdkit_descriptor.shape) > 2:
+                rdkit_descriptor = rdkit_descriptor.mean(dim=1)
+            if len(rdkit_fingerprint.shape) > 2:
+                rdkit_fingerprint = rdkit_fingerprint.mean(dim=1)
+            if len(maccs_fingerprint.shape) > 2:
+                maccs_fingerprint = maccs_fingerprint.mean(dim=1)
+            if len(morgan_fingerprint.shape) > 2:
+                morgan_fingerprint = morgan_fingerprint.mean(dim=1)
 
         attention_weights_rdkit = self.attention_rdkit_descriptor(rdkit_descriptor)
         attention_weights_rdkit = F.softmax(attention_weights_rdkit, dim=-1)
@@ -249,7 +333,7 @@ class AttnFusionGCNNet(torch.nn.Module):
 
     def forward(self, data, current_epoch=0, total_epochs=100, warmup_epochs=5, return_contrastive_loss=True):
         """
-        Forward pass with CCL-ASPS Logic (修复版)
+        Forward pass with CCL-ASPS Logic (方案一完整版)
 
         新增参数:
             warmup_epochs: Warmup 轮数，用于配合 ASPS
@@ -263,10 +347,13 @@ class AttnFusionGCNNet(torch.nn.Module):
         target = data.target
         target_matrix = data.target_matrix if hasattr(data, 'target_matrix') else None
 
-        if target_matrix is None: raise ValueError("target_matrix is None.")
+        if target_matrix is None:
+            raise ValueError("target_matrix is None.")
 
-        if drugsmile.dtype == torch.float32 or drugsmile.dtype == torch.float64: drugsmile = drugsmile.long()
-        if target.dtype == torch.float32 or target.dtype == torch.float64: target = target.long()
+        if drugsmile.dtype == torch.float32 or drugsmile.dtype == torch.float64:
+            drugsmile = drugsmile.long()
+        if target.dtype == torch.float32 or target.dtype == torch.float64:
+            target = target.long()
         drugsmile = torch.clamp(drugsmile, 0, self.max_smile_idx)
         target = torch.clamp(target, 0, self.max_target_idx)
         batch_size = drugsmile.shape[0]
@@ -382,7 +469,8 @@ class AttnFusionGCNNet(torch.nn.Module):
         mirna_seq_features = conv_xt
 
         # 2. miRNA Matrix Processing (View 2)
-        if len(target_matrix.shape) == 3: target_matrix = target_matrix.unsqueeze(1)
+        if len(target_matrix.shape) == 3:
+            target_matrix = target_matrix.unsqueeze(1)
 
         matrix_feat = self.conv_matrix_1(target_matrix)
         matrix_feat = F.max_pool2d(self.relu(matrix_feat), kernel_size=2)
@@ -422,9 +510,9 @@ class AttnFusionGCNNet(torch.nn.Module):
         out = self.out(xc)
         out = self.ac(out)
 
-        # ============= CCL-ASPS 对比损失计算 (修复版) =============
+        # ============= ⭐ CCL-ASPS 对比损失计算 (方案一完整版) =============
         if return_contrastive_loss:
-            # 修复: 统一归一化所有特征
+            # 统一归一化所有特征
             mirna_seq_norm = F.normalize(mirna_seq_features, dim=1)
             mirna_cgr_norm = F.normalize(mirna_cgr_features, dim=1)
             mirna_fused_norm = F.normalize(mirna_features, dim=1)
@@ -433,31 +521,39 @@ class AttnFusionGCNNet(torch.nn.Module):
             drug_mol_norm = F.normalize(drug_mol_features, dim=1)
             drug_fused_norm = F.normalize(drug_features, dim=1)
 
-            # 封装 ASPS 参数 (新增 warmup_epochs)
+            # 封装 ASPS 参数
             args_sim = {
                 'current_epoch': current_epoch,
                 'epochs': total_epochs,
-                'beta': 0.8,  # 修复: 增加到 0.8，允许后期使用更多困难样本
+                'beta': 0.8,
                 'warmup_epochs': warmup_epochs
             }
 
-            # --- miRNA 协作对比 (修复版) ---
+            # --- miRNA 协作对比 (方案一版本) ---
             mirna_sim_matrix = torch.mm(mirna_fused_norm, mirna_fused_norm.t())
             pos_mask, neg_mask = get_contrast_pair_batch(args_sim, mirna_sim_matrix, data.target.device)
 
-            # 修复: 使用归一化后的特征
-            loss_mirna_seq = self.contrast_mirna(mirna_seq_norm, mirna_fused_norm, pos_mask, neg_mask)
-            loss_mirna_cgr = self.contrast_mirna(mirna_cgr_norm, mirna_fused_norm, pos_mask, neg_mask)
-            loss_mirna_contrastive = loss_mirna_seq + loss_mirna_cgr
+            # ⭐ 关键修改：调用新的 Model_Contrast，传入 fused_embs
+            loss_mirna_contrastive = self.contrast_mirna(
+                v1_embs=mirna_seq_norm,
+                v2_embs=mirna_cgr_norm,
+                fused_embs=mirna_fused_norm,  # 会在内部 detach
+                pos=pos_mask,
+                neg=neg_mask
+            )
 
-            # --- Drug 协作对比 (修复版) ---
+            # --- Drug 协作对比 (方案一版本) ---
             drug_sim_matrix = torch.mm(drug_fused_norm, drug_fused_norm.t())
             pos_mask_d, neg_mask_d = get_contrast_pair_batch(args_sim, drug_sim_matrix, data.target.device)
 
-            # 修复: 使用归一化后的特征
-            loss_drug_seq = self.contrast_drug(drug_seq_norm, drug_fused_norm, pos_mask_d, neg_mask_d)
-            loss_drug_mol = self.contrast_drug(drug_mol_norm, drug_fused_norm, pos_mask_d, neg_mask_d)
-            loss_drug_contrastive = loss_drug_seq + loss_drug_mol
+            # ⭐ 关键修改：调用新的 Model_Contrast，传入 fused_embs
+            loss_drug_contrastive = self.contrast_drug(
+                v1_embs=drug_seq_norm,
+                v2_embs=drug_mol_norm,
+                fused_embs=drug_fused_norm,  # 会在内部 detach
+                pos=pos_mask_d,
+                neg=neg_mask_d
+            )
 
             loss_dict = {
                 'contrastive_mirna': loss_mirna_contrastive,
