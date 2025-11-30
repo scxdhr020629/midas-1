@@ -1,0 +1,10 @@
+{
+    "LR": 0.0005,
+    "WEIGHT_DECAY": 0.0032,
+    "BATCH_SIZE": 64,
+    "ALPHA": 0.1,
+    "BETA": 1.0,
+    "GAMMA": 1.0,
+    "TEMPERATURE": 0.1,
+    "DROPOUT": 0.2
+}
