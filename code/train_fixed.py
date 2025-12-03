@@ -27,8 +27,8 @@ NUM_EPOCHS = 45  # 增加最大轮数，因为有了早停，我们可以设大�
 PATIENCE = 7      # 早停耐心值
 
 # --- 对比学习参数 ---
-ALPHA = 0.1     # miRNA 视图对比损失权重
-BETA = 1.0      # Drug 视图对比损失权重
+ALPHA = 0.5     # miRNA 视图对比损失权重
+BETA = 0.5      # Drug 视图对比损失权重
 GAMMA = 1.0     # 主任务 (BCE) 权重
 WARMUP_EPOCHS = 5
 TEMPERATURE = 0.1

@@ -129,6 +129,9 @@ def get_contrast_pair_batch(args, feat_sim, device):
 # ==========================================
 # 3. 主模型 (AttnFusionGCNNet) - 修复版
 # ==========================================
+
+# 请保持上面的 Model_Contrast 和 get_contrast_pair_batch 不变
+
 class AttnFusionGCNNet(torch.nn.Module):
     def __init__(self, n_output=1, n_filters=32, embed_dim=64, num_features_xd=78,
                  num_features_smile=66, num_features_xt=25, output_dim=128, dropout=0.2,
@@ -138,13 +141,13 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.n_output = n_output
         self.output_dim = output_dim
         self.contrastive_dim = contrastive_dim
-
+        
         # Embedding 参数
         self.max_smile_idx = num_features_smile
         self.max_target_idx = num_features_xt
         self.smile_embed = nn.Embedding(num_features_smile + 1, embed_dim)
 
-        # ============ Drug Encoders ============
+        # ============ Drug Encoders (保持不变) ============
         # CNN Branch 1
         self.conv_xd_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
         self.conv_xd_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=3, padding=1)
@@ -185,7 +188,7 @@ class AttnFusionGCNNet(torch.nn.Module):
         # ============ miRNA Encoders ============
         self.embedding_xt = nn.Embedding(num_features_xt + 1, embed_dim)
 
-        # miRNA Sequence CNNs
+        # 1. miRNA Sequence CNNs (保持不变)
         self.conv_xt_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=4, padding=2)
         self.conv_xt_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=4, padding=2)
         self.conv_xt_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
@@ -193,17 +196,41 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.conv_xt_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
         self.conv_xt_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
 
-        # miRNA Matrix CNNs
+        # 2. miRNA Matrix CNNs (✨ 针对 16x16 输入优化 ✨)
+        # 输入: [Batch, 1, 16, 16]
+        
+        # Layer 1: 16x16 -> 8x8
         self.conv_matrix_1 = nn.Conv2d(1, n_filters, kernel_size=3, padding=1)
+        
+        # Layer 2: 8x8 -> 4x4
         self.conv_matrix_2 = nn.Conv2d(n_filters, n_filters * 2, kernel_size=3, padding=1)
+        
+        # Layer 3: 4x4 -> 4x4 (不再池化)
         self.conv_matrix_3 = nn.Conv2d(n_filters * 2, n_filters * 4, kernel_size=3, padding=1)
-        self.fc_matrix_1 = nn.Linear(n_filters * 4 * 4 * 4, 256)
+        
+        # 计算 Flatten 后的维度:
+        # Channels: n_filters * 4 (即 32*4 = 128)
+        # Height * Width: 4 * 4 = 16
+        # Total: 128 * 16 = 2048
+        self.flatten_dim = (n_filters * 4) * 4 * 4
+        
+        self.fc_matrix_1 = nn.Linear(self.flatten_dim, 256)
         self.fc_matrix_2 = nn.Linear(256, output_dim)
 
+        # miRNA Attention
         self.mirna_attn = nn.MultiheadAttention(embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.05)
         self.layer_norm_mirna = nn.LayerNorm(output_dim, eps=1e-3)
 
-        # ============ 对比学习模块 (修复版) ============
+        # ✨ 新增: miRNA 最终融合层 (Scheme A) ✨
+        # 结构与 fusion_drug_final 对齐
+        self.fusion_mirna_final = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            self.relu,
+            self.dropout
+        )
+
+        # ============ 对比学习模块 ============
+        # 假设你已经定义了 Model_Contrast
         self.contrast_drug = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
         self.contrast_mirna = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
 
@@ -212,8 +239,8 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.out = nn.Linear(256, self.n_output)
         self.ac = nn.Sigmoid()
 
+    # process_drug_fingerprints 函数保持不变...
     def process_drug_fingerprints(self, rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint):
-        """Process drug fingerprint features with self-attention"""
         if len(rdkit_descriptor.shape) == 1: rdkit_descriptor = rdkit_descriptor.unsqueeze(0)
         if len(rdkit_fingerprint.shape) == 1: rdkit_fingerprint = rdkit_fingerprint.unsqueeze(0)
         if len(maccs_fingerprint.shape) == 1: maccs_fingerprint = maccs_fingerprint.unsqueeze(0)
@@ -248,12 +275,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         return drug_features
 
     def forward(self, data, current_epoch=0, total_epochs=100, warmup_epochs=5, return_contrastive_loss=True):
-        """
-        Forward pass with CCL-ASPS Logic (修复版)
-
-        新增参数:
-            warmup_epochs: Warmup 轮数，用于配合 ASPS
-        """
         # ============= Data Loading & Preprocessing =============
         rdkit_fingerprint = data.rdkit_fingerprint
         rdkit_descriptor = data.rdkit_descriptor
@@ -283,18 +304,15 @@ class AttnFusionGCNNet(torch.nn.Module):
         morgan_fingerprint = torch.nan_to_num(morgan_fingerprint, nan=0.0)
         target_matrix = torch.nan_to_num(target_matrix, nan=0.0)
 
-        # ============= Drug Processing =============
-
-        # 1. Drug Fingerprint Processing (View 1)
+        # ============= Drug Processing (保持不变) =============
+        # 1. Drug Fingerprint (View 1)
         fingerprint_features = self.process_drug_fingerprints(
             rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint
         )
         drug_mol_features = fingerprint_features
 
-        # 2. SMILES Sequence Processing (View 2)
+        # 2. SMILES Sequence (View 2)
         embedded_smile = self.smile_embed(drugsmile).permute(0, 2, 1)
-
-        # Branch 1
         conv_xd1 = self.conv_xd_11(embedded_smile)
         conv_xd1 = self.relu(conv_xd1)
         conv_xd1 = self.dropout(conv_xd1)
@@ -303,7 +321,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd1 = self.relu(conv_xd1)
         conv_xd1 = F.max_pool1d(conv_xd1, conv_xd1.size(2)).squeeze(2)
 
-        # Branch 2
         conv_xd2 = self.conv_xd_21(embedded_smile)
         conv_xd2 = self.relu(conv_xd2)
         conv_xd2 = self.dropout(conv_xd2)
@@ -313,7 +330,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd2 = self.dropout(conv_xd2)
         conv_xd2 = F.max_pool1d(conv_xd2, conv_xd2.size(2)).squeeze(2)
 
-        # Branch 3
         conv_xd3 = self.conv_xd_31(embedded_smile)
         conv_xd3 = self.relu(conv_xd3)
         conv_xd3 = self.dropout(conv_xd3)
@@ -322,7 +338,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd3 = self.relu(conv_xd3)
         conv_xd3 = F.max_pool1d(conv_xd3, conv_xd3.size(2)).squeeze(2)
 
-        # Combine branches
         conv_xd1 = self.fc_smiles(conv_xd1)
         conv_xd2 = self.fc_smiles(conv_xd2)
         conv_xd3 = self.fc_smiles(conv_xd3)
@@ -332,25 +347,20 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd = torch.nan_to_num(conv_xd, nan=0.0)
         drug_seq_features = conv_xd
 
-        # 3. Drug Fusion (Fused View)
+        # 3. Drug Fusion
         smiles_unsq = conv_xd.unsqueeze(1)
         fingerprint_unsq = fingerprint_features.unsqueeze(1)
-
         attn_out, _ = self.drug_attn(query=smiles_unsq, key=fingerprint_unsq, value=fingerprint_unsq)
         attn_out = torch.nan_to_num(attn_out.squeeze(1), nan=0.0)
-
         residual_in_drug = attn_out + conv_xd
         drug_features_attn = self.layer_norm_drug(residual_in_drug)
-
         drug_concat = torch.cat([drug_features_attn, fingerprint_features], dim=1)
         drug_features = self.fusion_drug_final(drug_concat)
 
         # ============= miRNA Processing =============
 
-        # 1. miRNA Sequence Processing (View 1)
+        # 1. miRNA Sequence (View 1)
         embedded_xt = self.embedding_xt(target).permute(0, 2, 1)
-
-        # Branch 1
         conv_xt1 = self.conv_xt_11(embedded_xt)
         conv_xt1 = self.relu(conv_xt1)
         conv_xt1 = self.dropout(conv_xt1)
@@ -358,7 +368,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt1 = self.relu(conv_xt1)
         conv_xt1 = F.max_pool1d(conv_xt1, conv_xt1.size(2)).squeeze(2)
 
-        # Branch 2
         conv_xt2 = self.conv_xt_21(embedded_xt)
         conv_xt2 = self.relu(conv_xt2)
         conv_xt2 = self.dropout(conv_xt2)
@@ -366,7 +375,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt2 = self.relu(conv_xt2)
         conv_xt2 = F.max_pool1d(conv_xt2, conv_xt2.size(2)).squeeze(2)
 
-        # Branch 3
         conv_xt3 = self.conv_xt_31(embedded_xt)
         conv_xt3 = self.relu(conv_xt3)
         conv_xt3 = self.dropout(conv_xt3)
@@ -375,44 +383,53 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt3 = self.relu(conv_xt3)
         conv_xt3 = F.max_pool1d(conv_xt3, conv_xt3.size(2)).squeeze(2)
 
-        # Combine branches
         conv_xt = torch.cat((conv_xt1, conv_xt2, conv_xt3), dim=1).unsqueeze(2)
         conv_xt = self.conv_reduce_xt(conv_xt).squeeze(2)
         conv_xt = torch.nan_to_num(conv_xt, nan=0.0)
         mirna_seq_features = conv_xt
 
-        # 2. miRNA Matrix Processing (View 2)
+        # 2. miRNA Matrix (View 2) ✨ 优化版 ✨
         if len(target_matrix.shape) == 3: target_matrix = target_matrix.unsqueeze(1)
-
+        
+        # Layer 1: 16 -> 8
         matrix_feat = self.conv_matrix_1(target_matrix)
-        matrix_feat = F.max_pool2d(self.relu(matrix_feat), kernel_size=2)
-
+        matrix_feat = self.relu(matrix_feat)
+        matrix_feat = F.max_pool2d(matrix_feat, kernel_size=2)
+        
+        # Layer 2: 8 -> 4
         matrix_feat = self.conv_matrix_2(matrix_feat)
-        matrix_feat = F.max_pool2d(self.relu(matrix_feat), kernel_size=2)
-
+        matrix_feat = self.relu(matrix_feat)
+        matrix_feat = F.max_pool2d(matrix_feat, kernel_size=2)
+        
+        # Layer 3: 4 -> 4 (不做池化!)
         matrix_feat = self.conv_matrix_3(matrix_feat)
         matrix_feat = self.relu(matrix_feat)
         matrix_feat = self.dropout(matrix_feat)
-
+        
+        # Flatten and FC
         matrix_feat = matrix_feat.view(matrix_feat.size(0), -1)
         matrix_feat = self.fc_matrix_1(matrix_feat)
         matrix_feat = self.relu(matrix_feat)
         matrix_feat = self.dropout(matrix_feat)
-
         matrix_feat = self.fc_matrix_2(matrix_feat)
         matrix_feat = torch.nan_to_num(matrix_feat, nan=0.0)
         mirna_cgr_features = matrix_feat
 
-        # 3. miRNA Fusion (Fused View)
+        # 3. miRNA Fusion (Fused View) ✨ Scheme A 实现 ✨
         xt_unsq = conv_xt.unsqueeze(1)
         mat_unsq = matrix_feat.unsqueeze(1)
 
+        # Cross Attention: Query=Seq, Key=Matrix, Value=Matrix
         attn_out_m, _ = self.mirna_attn(query=xt_unsq, key=mat_unsq, value=mat_unsq)
         attn_out_m = torch.nan_to_num(attn_out_m.squeeze(1), nan=0.0)
 
+        # 残差连接 (Seq part)
         residual_in_mirna = attn_out_m + conv_xt
-        mirna_features = self.layer_norm_mirna(residual_in_mirna)
-        mirna_features = self.relu(mirna_features)
+        mirna_features_attn = self.layer_norm_mirna(residual_in_mirna)
+        
+        # ✨ 关键改动：显式拼接矩阵特征 (与 Drug 分支保持一致) ✨
+        mirna_concat = torch.cat([mirna_features_attn, matrix_feat], dim=1)
+        mirna_features = self.fusion_mirna_final(mirna_concat)
 
         # ============= Final Prediction =============
         xc = torch.cat((drug_features, mirna_features), dim=1)
@@ -422,9 +439,8 @@ class AttnFusionGCNNet(torch.nn.Module):
         out = self.out(xc)
         out = self.ac(out)
 
-        # ============= CCL-ASPS 对比损失计算 (修复版) =============
+        # ============= Contrastive Loss (保持不变) =============
         if return_contrastive_loss:
-            # 修复: 统一归一化所有特征
             mirna_seq_norm = F.normalize(mirna_seq_features, dim=1)
             mirna_cgr_norm = F.normalize(mirna_cgr_features, dim=1)
             mirna_fused_norm = F.normalize(mirna_features, dim=1)
@@ -433,28 +449,23 @@ class AttnFusionGCNNet(torch.nn.Module):
             drug_mol_norm = F.normalize(drug_mol_features, dim=1)
             drug_fused_norm = F.normalize(drug_features, dim=1)
 
-            # 封装 ASPS 参数 (新增 warmup_epochs)
             args_sim = {
                 'current_epoch': current_epoch,
                 'epochs': total_epochs,
-                'beta': 0.8,  # 修复: 增加到 0.8，允许后期使用更多困难样本
+                'beta': 0.8,
                 'warmup_epochs': warmup_epochs
             }
 
-            # --- miRNA 协作对比 (修复版) ---
             mirna_sim_matrix = torch.mm(mirna_fused_norm, mirna_fused_norm.t())
             pos_mask, neg_mask = get_contrast_pair_batch(args_sim, mirna_sim_matrix, data.target.device)
 
-            # 修复: 使用归一化后的特征
             loss_mirna_seq = self.contrast_mirna(mirna_seq_norm, mirna_fused_norm, pos_mask, neg_mask)
             loss_mirna_cgr = self.contrast_mirna(mirna_cgr_norm, mirna_fused_norm, pos_mask, neg_mask)
             loss_mirna_contrastive = loss_mirna_seq + loss_mirna_cgr
 
-            # --- Drug 协作对比 (修复版) ---
             drug_sim_matrix = torch.mm(drug_fused_norm, drug_fused_norm.t())
             pos_mask_d, neg_mask_d = get_contrast_pair_batch(args_sim, drug_sim_matrix, data.target.device)
 
-            # 修复: 使用归一化后的特征
             loss_drug_seq = self.contrast_drug(drug_seq_norm, drug_fused_norm, pos_mask_d, neg_mask_d)
             loss_drug_mol = self.contrast_drug(drug_mol_norm, drug_fused_norm, pos_mask_d, neg_mask_d)
             loss_drug_contrastive = loss_drug_seq + loss_drug_mol

@@ -17,7 +17,7 @@ from torch_geometric.loader import DataLoader
 # ============================================================================
 
 # 搜索尝试次数 (根据你的显卡时间和耐心设置，建议 20-50 次)
-N_TRIALS = 20  
+N_TRIALS = 25
 
 # 定义参数网格
 PARAM_GRID = {
