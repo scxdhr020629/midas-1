@@ -16,7 +16,7 @@ NUM_FOLDS = 5
 loss_fn = nn.BCELoss()
 
 # ============================================================================
-# ✨ 超参数配置 (Pure ASPS - 使用最后一轮模型)
+# ✨ 超参数配置 (Standard CCL - 无动态采样)
 # ============================================================================
 LR = 0.0005
 WEIGHT_DECAY = 0.0032
@@ -33,14 +33,10 @@ TEMPERATURE = 0.1
 LAM = 0.5
 CONTRASTIVE_DIM = 128
 
-# ✨ ASPS 完全激活的轮数
-ASPS_FULL_ACTIVATION_EPOCH = int(WARMUP_EPOCHS + 0.5 * (NUM_EPOCHS - WARMUP_EPOCHS))
-
 print(f"{'='*70}")
-print(f"[Config] Training Mode: PURE ASPS (使用最后一轮模型)")
+print(f"[Config] Training Mode: Standard CCL (ASPS Removed)")
 print(f"[Config] Total Epochs: {NUM_EPOCHS}")
-print(f"[Config] Warmup Epochs: {WARMUP_EPOCHS}")
-print(f"[Config] ASPS Full Activation at Epoch: {ASPS_FULL_ACTIVATION_EPOCH}")
+print(f"[Config] Warmup Epochs (for Loss Weight): {WARMUP_EPOCHS}")
 print(f"[Config] Model Selection: 最后一轮 (Epoch {NUM_EPOCHS})")
 print(f"{'='*70}\n")
 
@@ -48,6 +44,9 @@ print(f"{'='*70}\n")
 # 训练函数
 # ============================================================================
 def get_contrastive_weight(epoch, warmup_epochs=5):
+    """
+    保留 Loss 权重的 Warmup 逻辑，防止早期对比 Loss 干扰主任务
+    """
     if epoch <= warmup_epochs:
         progress = epoch / warmup_epochs
         return 0.5 * (1 - np.cos(np.pi * progress))
@@ -55,14 +54,22 @@ def get_contrastive_weight(epoch, warmup_epochs=5):
 
 def train(model, device, train_loader, optimizer, epoch):
     model.train()
-    total_loss = 0
+    # 初始化累加器
+    metrics = {
+        'total_loss': 0,
+        'bce_loss': 0,
+        'mirna_cl_loss': 0,
+        'drug_cl_loss': 0
+    }
     batch_count = 0
+    # 获取当前 epoch 的对比损失权重
     contrastive_weight_factor = get_contrastive_weight(epoch, WARMUP_EPOCHS)
 
     for batch_idx, data in enumerate(train_loader):
         optimizer.zero_grad()
         data = data.to(device)
 
+        # 参数传入保持兼容性，但内部已不再使用 epoch 进行动态采样
         output, loss_dict = model(
             data,
             current_epoch=epoch,
@@ -75,10 +82,12 @@ def train(model, device, train_loader, optimizer, epoch):
         output = output.view(-1, 1)
         output = torch.clamp(output, min=1e-7, max=1.0 - 1e-7)
         
+        # 计算各项 Loss
         loss_bce = loss_fn(output, labels)
         loss_mirna_contrastive = loss_dict['contrastive_mirna']
         loss_drug_contrastive = loss_dict['contrastive_drug']
 
+        # 总 Loss
         loss = (GAMMA * loss_bce +
                 contrastive_weight_factor * (ALPHA * loss_mirna_contrastive +
                                              BETA * loss_drug_contrastive))
@@ -91,10 +100,15 @@ def train(model, device, train_loader, optimizer, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
 
-        total_loss += loss.item()
+        # 记录数值
+        metrics['total_loss'] += loss.item()
+        metrics['bce_loss'] += loss_bce.item()
+        metrics['mirna_cl_loss'] += loss_mirna_contrastive.item()
+        metrics['drug_cl_loss'] += loss_drug_contrastive.item()
         batch_count += 1
 
-    return total_loss / batch_count
+    # 计算平均值
+    return {k: v / batch_count for k, v in metrics.items()}
 
 def predicting(model, device, loader):
     model.eval()
@@ -119,6 +133,7 @@ def predicting(model, device, loader):
     total_labels = np.array(total_labels)
     total_preds = (total_probs >= 0.5).astype(int)
 
+    # 计算各项指标
     accuracy = accuracy_score(total_labels, total_preds)
     precision = precision_score(total_labels, total_preds, zero_division=0)
     recall = recall_score(total_labels, total_preds, zero_division=0)
@@ -169,28 +184,32 @@ if __name__ == "__main__":
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=LR * 0.01)
 
-        # ✨ 训练循环 - 不再追踪最佳模型，直接使用最后一轮
+        print(f"{'Epoch':<5} | {'TotLoss':<7} {'BCE':<7} {'miR_CL':<7} {'Drug_CL':<7} | {'AUC':<7} {'AUPR':<7} {'F1':<7} {'Acc':<7} {'Rec':<7}")
+        print("-" * 100)
+
         for epoch in range(1, NUM_EPOCHS + 1):
-            loss_val = train(model, device, train_loader, optimizer, epoch)
-            if loss_val is None:
+            # 1. 训练并获取详细 Loss
+            train_metrics = train(model, device, train_loader, optimizer, epoch)
+            
+            if train_metrics is None: # Loss NaN check
                 break
 
             scheduler.step()
+            
+            # 2. 验证并获取详细指标
             acc, prec, rec, f1, auc_score, pr_auc_score = predicting(model, device, test_loader)
             
-            # 显示当前训练阶段
-            if epoch <= WARMUP_EPOCHS:
-                phase = "Warmup"
-            elif epoch < ASPS_FULL_ACTIVATION_EPOCH:
-                phase = f"ASPS Ramping ({epoch}/{ASPS_FULL_ACTIVATION_EPOCH})"
-            else:
-                phase = "ASPS Full"
-            
-            print(f'Epoch {epoch:03d} [{phase}]: Loss={loss_val:.5f} | Val AUC={auc_score:.5f}')
+            # 3. 详细打印
+            print(f"{epoch:<5} | "
+                  f"{train_metrics['total_loss']:.4f}  {train_metrics['bce_loss']:.4f}  "
+                  f"{train_metrics['mirna_cl_loss']:.4f}  {train_metrics['drug_cl_loss']:.4f}   | "
+                  f"{auc_score:.4f}  {pr_auc_score:.4f}  {f1:.4f}  {acc:.4f}  {rec:.4f}")
 
-        # ✨ 直接使用最后一轮的模型进行最终评估（无需加载任何保存的模型）
-        print(f"\n使用最后一轮 (Epoch {NUM_EPOCHS}) 的模型进行最终评估...")
+        # --- Fold 结束 ---
+        print(f"\n[Fold {fold + 1} Final] (Using Last Epoch Model)")
         acc, prec, rec, f1, auc_score, pr_auc_score = predicting(model, device, test_loader)
+        
+        print(f"Result -> AUC: {auc_score:.4f}, AUPR: {pr_auc_score:.4f}, F1: {f1:.4f}, Acc: {acc:.4f}, Rec: {rec:.4f}")
 
         metrics_history['acc'].append(acc)
         metrics_history['prec'].append(prec)
@@ -199,12 +218,13 @@ if __name__ == "__main__":
         metrics_history['auc'].append(auc_score)
         metrics_history['pr_auc'].append(pr_auc_score)
 
-        print(f"\nFold {fold + 1} Final Result → AUC: {auc_score:.4f}, AUPR: {pr_auc_score:.4f}")
-
-    print("\n" + "="*70)
-    print("FINAL 5-FOLD CV RESULTS (使用最后一轮模型)")
-    print("="*70)
-    print(f"AUC:      {np.mean(metrics_history['auc']):.4f} ± {np.std(metrics_history['auc']):.4f}")
-    print(f"AUPR:     {np.mean(metrics_history['pr_auc']):.4f} ± {np.std(metrics_history['pr_auc']):.4f}")
-    print(f"Accuracy: {np.mean(metrics_history['acc']):.4f} ± {np.std(metrics_history['acc']):.4f}")
-    print("="*70)
+    print("\n" + "="*80)
+    print("FINAL 5-FOLD CV RESULTS (Mean ± Std)")
+    print("="*80)
+    print(f"AUC:       {np.mean(metrics_history['auc']):.4f} ± {np.std(metrics_history['auc']):.4f}")
+    print(f"AUPR:      {np.mean(metrics_history['pr_auc']):.4f} ± {np.std(metrics_history['pr_auc']):.4f}")
+    print(f"Accuracy:  {np.mean(metrics_history['acc']):.4f} ± {np.std(metrics_history['acc']):.4f}")
+    print(f"F1-Score:  {np.mean(metrics_history['f1']):.4f} ± {np.std(metrics_history['f1']):.4f}")
+    print(f"Recall:    {np.mean(metrics_history['rec']):.4f} ± {np.std(metrics_history['rec']):.4f}")
+    print(f"Precision: {np.mean(metrics_history['prec']):.4f} ± {np.std(metrics_history['prec']):.4f}")
+    print("="*80)

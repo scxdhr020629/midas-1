@@ -3,9 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 
-
 # ==========================================
-# 1. CCL 核心对比模块 (Model_Contrast) - 保留不变
+# 1. CCL 核心对比模块 (Model_Contrast)
 # ==========================================
 class Model_Contrast(nn.Module):
     def __init__(self, hidden_dim, tau, lam):
@@ -17,61 +16,65 @@ class Model_Contrast(nn.Module):
         )
         self.tau = tau
         self.lam = lam
-        # 初始化权重
         for model in self.proj:
             if isinstance(model, nn.Linear):
                 nn.init.xavier_normal_(model.weight, gain=1.414)
 
     def sim(self, z1, z2):
-        """计算余弦相似度矩阵"""
         z1_norm = torch.norm(z1, dim=-1, keepdim=True)
         z2_norm = torch.norm(z2, dim=-1, keepdim=True)
         dot_numerator = torch.mm(z1, z2.t())
         dot_denominator = torch.mm(z1_norm, z2_norm.t())
-
-        # 先计算余弦相似度，再除以温度，最后 exp
         cos_sim = dot_numerator / (dot_denominator + 1e-8)
         sim_matrix = torch.exp(cos_sim / self.tau)
         return sim_matrix
 
     def forward(self, v1_embs, v2_embs, pos=None, neg=None):
-        """
-        InfoNCE 损失计算
-        """
         v1_embs = self.proj(v1_embs)
         v2_embs = self.proj(v2_embs)
-
-        # 计算相似度矩阵
         matrix_1to2 = self.sim(v1_embs, v2_embs)
-
-        # 应用掩码: 正样本和负样本的相似度
-        pos_sim = (matrix_1to2 * pos).sum(dim=1)  # [batch_size]
-        neg_sim = (matrix_1to2 * neg).sum(dim=1)  # [batch_size]
-
-        # InfoNCE Loss
+        pos_sim = (matrix_1to2 * pos).sum(dim=1)
+        neg_sim = (matrix_1to2 * neg).sum(dim=1)
         loss = -torch.log(pos_sim / (pos_sim + neg_sim + 1e-8) + 1e-8)
-
         return loss.mean()
 
+# ==========================================
+# 2. ASPS 动态采样策略
+# ==========================================
+def get_contrast_pair_batch(args, feat_sim, device):
+    batch_size = feat_sim.shape[0]
+    current_epoch = args.current_epoch if hasattr(args, 'current_epoch') else args['current_epoch']
+    total_epoch = args.epochs if hasattr(args, 'epochs') else args['epochs']
+    
+    # 【注意】这里的 beta 是 ASPS 内部控制采样数量的系数，不是 Loss 的权重
+    beta = args.beta if hasattr(args, 'beta') else 0.5 
+    warmup_epochs = args.get('warmup_epochs', 5)
 
-# ==========================================
-# 2. 采样策略 (ASPS 已移除 -> 转为标准采样)
-# ==========================================
-def get_contrast_pair_batch(batch_size, device):
-    """
-    标准对比学习采样策略：
-    - 正样本 (Positive): 对角线 (自身与其他视图的自身)
-    - 负样本 (Negative): 除对角线外的所有样本
-    """
-    # 1. 基础正样本 (Positive): 对角线
     pos = torch.eye(batch_size).to(device)
+    neg_all = torch.ones_like(pos) - pos
+    max_neg_num = batch_size - 1
 
-    # 2. 基础负样本 (Negative): 所有非对角线
-    # 在标准 SimCLR/InfoNCE 中，除了正样本对之外，batch内其他所有样本都是负样本
-    neg = torch.ones(batch_size, batch_size).to(device) - pos
+    if current_epoch <= warmup_epochs:
+        neg = neg_all
+    else:
+        progress = (current_epoch - warmup_epochs) / (total_epoch - warmup_epochs)
+        progress = max(0.0, min(1.0, progress))
+        
+        # 使用 beta 控制硬负样本的数量
+        k_neg = int(max_neg_num * (progress ** 1.5) * beta)
+        k_neg = max(1, min(k_neg, max_neg_num))
 
+        feat_sim_masked = feat_sim.clone()
+        feat_sim_masked.fill_diagonal_(-9e15)
+        vals, indices = feat_sim_masked.topk(k=k_neg, dim=1, largest=True)
+        hard_neg_mask = torch.zeros_like(feat_sim).to(device)
+        hard_neg_mask.scatter_(1, indices, 1)
+
+        alpha = min(progress * 2, 1.0)
+        neg = alpha * hard_neg_mask + (1 - alpha) * neg_all
+
+    neg = neg * (1 - pos)
     return pos, neg
-
 
 # ==========================================
 # 3. 主模型 (AttnFusionGCNNet)
@@ -81,30 +84,21 @@ class AttnFusionGCNNet(torch.nn.Module):
                  num_features_smile=66, num_features_xt=25, output_dim=128, dropout=0.2,
                  contrastive_dim=128, temperature=0.1, lam=0.5):
         super(AttnFusionGCNNet, self).__init__()
-
         self.n_output = n_output
         self.output_dim = output_dim
         self.contrastive_dim = contrastive_dim
-        
-        # Embedding 参数
         self.max_smile_idx = num_features_smile
         self.max_target_idx = num_features_xt
         self.smile_embed = nn.Embedding(num_features_smile + 1, embed_dim)
 
-        # ============ Drug Encoders ============
-        # CNN Branch 1
         self.conv_xd_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
         self.conv_xd_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=3, padding=1)
-        # CNN Branch 2
         self.conv_xd_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
         self.conv_xd_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
-        # CNN Branch 3
         self.conv_xd_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=1, padding=1)
         self.conv_xd_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=1, padding=1)
-
         self.fc_smiles = nn.Linear(n_filters * 2, output_dim)
 
-        # Drug Fingerprint components
         self.rdkit_descriptor_dim = 210
         self.rdkit_fingerprint_dim = 136
         self.maccs_dim = 166
@@ -114,7 +108,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.attention_maccs = nn.Linear(self.maccs_dim, self.maccs_dim)
         self.drug_fingerprint_transform = nn.Linear(self.combined_dim, output_dim)
 
-        # Drug Feature Fusion
         self.drug_attn = nn.MultiheadAttention(embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.1)
         self.layer_norm_drug = nn.LayerNorm(output_dim, eps=1e-3)
         self.relu = nn.LeakyReLU(0.01)
@@ -129,10 +122,7 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.conv_reduce_smiles = nn.Conv1d(in_channels=output_dim * 3, out_channels=output_dim, kernel_size=1)
         self.conv_reduce_xt = nn.Conv1d(in_channels=192, out_channels=output_dim, kernel_size=1)
 
-        # ============ miRNA Encoders ============
         self.embedding_xt = nn.Embedding(num_features_xt + 1, embed_dim)
-
-        # 1. miRNA Sequence CNNs
         self.conv_xt_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=4, padding=2)
         self.conv_xt_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=4, padding=2)
         self.conv_xt_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
@@ -140,17 +130,13 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.conv_xt_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
         self.conv_xt_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
 
-        # 2. miRNA Matrix CNNs
         self.conv_matrix_1 = nn.Conv2d(1, n_filters, kernel_size=3, padding=1)
         self.conv_matrix_2 = nn.Conv2d(n_filters, n_filters * 2, kernel_size=3, padding=1)
         self.conv_matrix_3 = nn.Conv2d(n_filters * 2, n_filters * 4, kernel_size=3, padding=1)
-        
         self.flatten_dim = (n_filters * 4) * 4 * 4
-        
         self.fc_matrix_1 = nn.Linear(self.flatten_dim, 256)
         self.fc_matrix_2 = nn.Linear(256, output_dim)
 
-        # miRNA Attention
         self.mirna_attn = nn.MultiheadAttention(embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.05)
         self.layer_norm_mirna = nn.LayerNorm(output_dim, eps=1e-3)
 
@@ -160,51 +146,39 @@ class AttnFusionGCNNet(torch.nn.Module):
             self.dropout
         )
 
-        # ============ 对比学习模块 ============
         self.contrast_drug = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
         self.contrast_mirna = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
 
-        # Final layers
         self.fc1 = nn.Linear(output_dim * 2, 256)
         self.out = nn.Linear(256, self.n_output)
-        self.ac = nn.Sigmoid()
+        # self.ac = nn.Sigmoid() # 保持去掉 Sigmoid
 
     def process_drug_fingerprints(self, rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint):
         if len(rdkit_descriptor.shape) == 1: rdkit_descriptor = rdkit_descriptor.unsqueeze(0)
         if len(rdkit_fingerprint.shape) == 1: rdkit_fingerprint = rdkit_fingerprint.unsqueeze(0)
         if len(maccs_fingerprint.shape) == 1: maccs_fingerprint = maccs_fingerprint.unsqueeze(0)
         if len(morgan_fingerprint.shape) == 1: morgan_fingerprint = morgan_fingerprint.unsqueeze(0)
-
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=UserWarning)
             if len(rdkit_descriptor.shape) > 2: rdkit_descriptor = rdkit_descriptor.mean(dim=1)
             if len(rdkit_fingerprint.shape) > 2: rdkit_fingerprint = rdkit_fingerprint.mean(dim=1)
             if len(maccs_fingerprint.shape) > 2: maccs_fingerprint = maccs_fingerprint.mean(dim=1)
             if len(morgan_fingerprint.shape) > 2: morgan_fingerprint = morgan_fingerprint.mean(dim=1)
-
         attention_weights_rdkit = self.attention_rdkit_descriptor(rdkit_descriptor)
         attention_weights_rdkit = F.softmax(attention_weights_rdkit, dim=-1)
         rdkit_descriptor_prime = rdkit_descriptor * attention_weights_rdkit
-
         attention_weights_maccs = self.attention_maccs(maccs_fingerprint)
         attention_weights_maccs = F.softmax(attention_weights_maccs, dim=-1)
         maccs_prime = maccs_fingerprint * attention_weights_maccs
-
-        combined_features = torch.cat([
-            rdkit_descriptor_prime,
-            maccs_prime,
-            rdkit_fingerprint,
-            morgan_fingerprint
-        ], dim=-1)
-
+        combined_features = torch.cat([rdkit_descriptor_prime, maccs_prime, rdkit_fingerprint, morgan_fingerprint], dim=-1)
         drug_features = self.drug_fingerprint_transform(combined_features)
         drug_features = self.relu(drug_features)
         drug_features = self.dropout(drug_features)
         drug_features = torch.nan_to_num(drug_features, nan=0.0, posinf=0.0, neginf=0.0)
         return drug_features
 
-    def forward(self, data, current_epoch=0, total_epochs=100, warmup_epochs=5, return_contrastive_loss=True):
-        # ============= Data Loading & Preprocessing =============
+    # 【重要修改】: 增加 asps_beta 参数，默认值设为 0.8
+    def forward(self, data, current_epoch=0, total_epochs=100, warmup_epochs=5, asps_beta=0.8, return_contrastive_loss=True):
         rdkit_fingerprint = data.rdkit_fingerprint
         rdkit_descriptor = data.rdkit_descriptor
         maccs_fingerprint = data.maccs_fingerprint
@@ -212,32 +186,24 @@ class AttnFusionGCNNet(torch.nn.Module):
         drugsmile = data.seqdrug
         target = data.target
         target_matrix = data.target_matrix if hasattr(data, 'target_matrix') else None
-
         if target_matrix is None: raise ValueError("target_matrix is None.")
-
         if drugsmile.dtype == torch.float32 or drugsmile.dtype == torch.float64: drugsmile = drugsmile.long()
         if target.dtype == torch.float32 or target.dtype == torch.float64: target = target.long()
         drugsmile = torch.clamp(drugsmile, 0, self.max_smile_idx)
         target = torch.clamp(target, 0, self.max_target_idx)
         batch_size = drugsmile.shape[0]
-
         rdkit_descriptor = rdkit_descriptor.view(batch_size, self.rdkit_descriptor_dim)
         rdkit_fingerprint = rdkit_fingerprint.view(batch_size, self.rdkit_fingerprint_dim)
         maccs_fingerprint = maccs_fingerprint.view(batch_size, self.maccs_dim)
         morgan_fingerprint = morgan_fingerprint.view(batch_size, self.morgan_dim)
-
         rdkit_descriptor = torch.nan_to_num(rdkit_descriptor, nan=0.0)
         rdkit_fingerprint = torch.nan_to_num(rdkit_fingerprint, nan=0.0)
         maccs_fingerprint = torch.nan_to_num(maccs_fingerprint, nan=0.0)
         morgan_fingerprint = torch.nan_to_num(morgan_fingerprint, nan=0.0)
         target_matrix = torch.nan_to_num(target_matrix, nan=0.0)
 
-        # ============= Drug Processing =============
-        fingerprint_features = self.process_drug_fingerprints(
-            rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint
-        )
+        fingerprint_features = self.process_drug_fingerprints(rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint)
         drug_mol_features = fingerprint_features
-
         embedded_smile = self.smile_embed(drugsmile).permute(0, 2, 1)
         conv_xd1 = self.conv_xd_11(embedded_smile)
         conv_xd1 = self.relu(conv_xd1)
@@ -246,7 +212,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd1 = self.conv_xd_12(conv_xd1)
         conv_xd1 = self.relu(conv_xd1)
         conv_xd1 = F.max_pool1d(conv_xd1, conv_xd1.size(2)).squeeze(2)
-
         conv_xd2 = self.conv_xd_21(embedded_smile)
         conv_xd2 = self.relu(conv_xd2)
         conv_xd2 = self.dropout(conv_xd2)
@@ -255,7 +220,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd2 = self.relu(conv_xd2)
         conv_xd2 = self.dropout(conv_xd2)
         conv_xd2 = F.max_pool1d(conv_xd2, conv_xd2.size(2)).squeeze(2)
-
         conv_xd3 = self.conv_xd_31(embedded_smile)
         conv_xd3 = self.relu(conv_xd3)
         conv_xd3 = self.dropout(conv_xd3)
@@ -263,16 +227,13 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd3 = self.conv_xd_32(conv_xd3)
         conv_xd3 = self.relu(conv_xd3)
         conv_xd3 = F.max_pool1d(conv_xd3, conv_xd3.size(2)).squeeze(2)
-
         conv_xd1 = self.fc_smiles(conv_xd1)
         conv_xd2 = self.fc_smiles(conv_xd2)
         conv_xd3 = self.fc_smiles(conv_xd3)
-
         conv_xd = torch.cat((conv_xd1, conv_xd2, conv_xd3), dim=1).unsqueeze(1).permute(0, 2, 1)
         conv_xd = self.conv_reduce_smiles(conv_xd).squeeze(2)
         conv_xd = torch.nan_to_num(conv_xd, nan=0.0)
         drug_seq_features = conv_xd
-
         smiles_unsq = conv_xd.unsqueeze(1)
         fingerprint_unsq = fingerprint_features.unsqueeze(1)
         attn_out, _ = self.drug_attn(query=smiles_unsq, key=fingerprint_unsq, value=fingerprint_unsq)
@@ -282,7 +243,6 @@ class AttnFusionGCNNet(torch.nn.Module):
         drug_concat = torch.cat([drug_features_attn, fingerprint_features], dim=1)
         drug_features = self.fusion_drug_final(drug_concat)
 
-        # ============= miRNA Processing =============
         embedded_xt = self.embedding_xt(target).permute(0, 2, 1)
         conv_xt1 = self.conv_xt_11(embedded_xt)
         conv_xt1 = self.relu(conv_xt1)
@@ -290,14 +250,12 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt1 = self.conv_xt_12(conv_xt1)
         conv_xt1 = self.relu(conv_xt1)
         conv_xt1 = F.max_pool1d(conv_xt1, conv_xt1.size(2)).squeeze(2)
-
         conv_xt2 = self.conv_xt_21(embedded_xt)
         conv_xt2 = self.relu(conv_xt2)
         conv_xt2 = self.dropout(conv_xt2)
         conv_xt2 = self.conv_xt_22(conv_xt2)
         conv_xt2 = self.relu(conv_xt2)
         conv_xt2 = F.max_pool1d(conv_xt2, conv_xt2.size(2)).squeeze(2)
-
         conv_xt3 = self.conv_xt_31(embedded_xt)
         conv_xt3 = self.relu(conv_xt3)
         conv_xt3 = self.dropout(conv_xt3)
@@ -305,26 +263,20 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt3 = self.conv_xt_32(conv_xt3)
         conv_xt3 = self.relu(conv_xt3)
         conv_xt3 = F.max_pool1d(conv_xt3, conv_xt3.size(2)).squeeze(2)
-
         conv_xt = torch.cat((conv_xt1, conv_xt2, conv_xt3), dim=1).unsqueeze(2)
         conv_xt = self.conv_reduce_xt(conv_xt).squeeze(2)
         conv_xt = torch.nan_to_num(conv_xt, nan=0.0)
         mirna_seq_features = conv_xt
-
         if len(target_matrix.shape) == 3: target_matrix = target_matrix.unsqueeze(1)
-        
         matrix_feat = self.conv_matrix_1(target_matrix)
         matrix_feat = self.relu(matrix_feat)
         matrix_feat = F.max_pool2d(matrix_feat, kernel_size=2)
-        
         matrix_feat = self.conv_matrix_2(matrix_feat)
         matrix_feat = self.relu(matrix_feat)
         matrix_feat = F.max_pool2d(matrix_feat, kernel_size=2)
-        
         matrix_feat = self.conv_matrix_3(matrix_feat)
         matrix_feat = self.relu(matrix_feat)
         matrix_feat = self.dropout(matrix_feat)
-        
         matrix_feat = matrix_feat.view(matrix_feat.size(0), -1)
         matrix_feat = self.fc_matrix_1(matrix_feat)
         matrix_feat = self.relu(matrix_feat)
@@ -332,53 +284,51 @@ class AttnFusionGCNNet(torch.nn.Module):
         matrix_feat = self.fc_matrix_2(matrix_feat)
         matrix_feat = torch.nan_to_num(matrix_feat, nan=0.0)
         mirna_cgr_features = matrix_feat
-
         xt_unsq = conv_xt.unsqueeze(1)
         mat_unsq = matrix_feat.unsqueeze(1)
-
         attn_out_m, _ = self.mirna_attn(query=xt_unsq, key=mat_unsq, value=mat_unsq)
         attn_out_m = torch.nan_to_num(attn_out_m.squeeze(1), nan=0.0)
-
         residual_in_mirna = attn_out_m + conv_xt
         mirna_features_attn = self.layer_norm_mirna(residual_in_mirna)
         mirna_concat = torch.cat([mirna_features_attn, matrix_feat], dim=1)
         mirna_features = self.fusion_mirna_final(mirna_concat)
-
-        # ============= Final Prediction =============
         xc = torch.cat((drug_features, mirna_features), dim=1)
         xc = self.fc1(xc)
         xc = self.relu(xc)
         xc = self.dropout(xc)
         out = self.out(xc)
-        out = self.ac(out)
 
-        # ============= Contrastive Loss (标准采样) =============
         if return_contrastive_loss:
             mirna_seq_norm = F.normalize(mirna_seq_features, dim=1)
             mirna_cgr_norm = F.normalize(mirna_cgr_features, dim=1)
             mirna_fused_norm = F.normalize(mirna_features, dim=1)
-
             drug_seq_norm = F.normalize(drug_seq_features, dim=1)
             drug_mol_norm = F.normalize(drug_mol_features, dim=1)
             drug_fused_norm = F.normalize(drug_features, dim=1)
 
-            # 移除 ASPS，使用标准采样 (Identity Matrix based)
-            pos_mask, neg_mask = get_contrast_pair_batch(batch_size, data.target.device)
+            # 【重要修改】: 将外部传入的 asps_beta 放入参数字典，覆盖默认值
+            args_sim = {
+                'current_epoch': current_epoch,
+                'epochs': total_epochs,
+                'beta': asps_beta, # 这里控制 ASPS 的采样数量 (k_neg)
+                'warmup_epochs': warmup_epochs
+            }
 
-            # 计算 Loss，传入固定的 mask
+            mirna_sim_matrix = torch.mm(mirna_fused_norm, mirna_fused_norm.t())
+            pos_mask, neg_mask = get_contrast_pair_batch(args_sim, mirna_sim_matrix, data.target.device)
             loss_mirna_seq = self.contrast_mirna(mirna_seq_norm, mirna_fused_norm, pos_mask, neg_mask)
             loss_mirna_cgr = self.contrast_mirna(mirna_cgr_norm, mirna_fused_norm, pos_mask, neg_mask)
             loss_mirna_contrastive = loss_mirna_seq + loss_mirna_cgr
 
-            loss_drug_seq = self.contrast_drug(drug_seq_norm, drug_fused_norm, pos_mask, neg_mask)
-            loss_drug_mol = self.contrast_drug(drug_mol_norm, drug_fused_norm, pos_mask, neg_mask)
+            drug_sim_matrix = torch.mm(drug_fused_norm, drug_fused_norm.t())
+            pos_mask_d, neg_mask_d = get_contrast_pair_batch(args_sim, drug_sim_matrix, data.target.device)
+            loss_drug_seq = self.contrast_drug(drug_seq_norm, drug_fused_norm, pos_mask_d, neg_mask_d)
+            loss_drug_mol = self.contrast_drug(drug_mol_norm, drug_fused_norm, pos_mask_d, neg_mask_d)
             loss_drug_contrastive = loss_drug_seq + loss_drug_mol
 
             loss_dict = {
                 'contrastive_mirna': loss_mirna_contrastive,
                 'contrastive_drug': loss_drug_contrastive,
             }
-
             return out, loss_dict
-
         return out
