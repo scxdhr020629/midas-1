@@ -1,423 +1,463 @@
-import sys
 import torch
 import torch.nn as nn
-import numpy as np
-from model_ablation import AttnFusionGCNNet
-from utils import *
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
-from torch_geometric.loader import DataLoader
-import os
-import time
-import json
+import torch.nn.functional as F
+import warnings
 
-# ============================================================================
-# 🔬 消融实验配置
-# ============================================================================
 
-ABLATION_CONFIGS = {
-    # 完整模型（Full Model）
-    "full": {
-        "use_contrastive": True,
-        "use_asps": True,
-        "description": "Full Model (Contrastive + ASPS)"
-    },
-    
-    # 无对比学习（No Contrastive Learning）
-    "no_contrastive": {
-        "use_contrastive": False,
-        "use_asps": True,
-        "description": "No Contrastive Learning (Only ASPS)"
-    },
-    
-    # 无ASPS（No ASPS - 固定负样本）
-    "no_asps": {
-        "use_contrastive": True,
-        "use_asps": False,
-        "description": "No ASPS (Fixed Negative Sampling)"
-    },
-    
-    # 基线模型（Baseline - 无对比学习和ASPS）
-    "baseline": {
-        "use_contrastive": False,
-        "use_asps": False,
-        "description": "Baseline (No Contrastive, No ASPS)"
-    }
-}
+# ==========================================
+# 1. CCL 核心对比模块 (Model_Contrast)
+# ==========================================
+class Model_Contrast(nn.Module):
+    def __init__(self, hidden_dim, tau, lam):
+        super(Model_Contrast, self).__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.tau = tau
+        self.lam = lam
+        # 初始化权重
+        for model in self.proj:
+            if isinstance(model, nn.Linear):
+                nn.init.xavier_normal_(model.weight, gain=1.414)
 
-# --- 全局常量 ---
-LOG_INTERVAL = 45
-NUM_FOLDS = 5
-loss_fn = nn.BCELoss()
+    def sim(self, z1, z2):
+        """计算余弦相似度矩阵"""
+        z1_norm = torch.norm(z1, dim=-1, keepdim=True)
+        z2_norm = torch.norm(z2, dim=-1, keepdim=True)
+        dot_numerator = torch.mm(z1, z2.t())
+        dot_denominator = torch.mm(z1_norm, z2_norm.t())
 
-# --- 超参数配置 ---
-LR = 0.0005
-WEIGHT_DECAY = 0.0032
-TRAIN_BATCH_SIZE = 64
-TEST_BATCH_SIZE = 64
-NUM_EPOCHS = 30
-WARMUP_EPOCHS = 5
+        # 先计算余弦相似度，再除以温度，最后 exp
+        cos_sim = dot_numerator / (dot_denominator + 1e-8)
+        sim_matrix = torch.exp(cos_sim / self.tau)
+        return sim_matrix
 
-# --- 对比学习参数 ---
-ALPHA = 0.5
-BETA = 0.5
-GAMMA = 1.0
-TEMPERATURE = 0.1
-LAM = 0.5
-CONTRASTIVE_DIM = 128
+    def forward(self, v1_embs, v2_embs, pos=None, neg=None):
+        """
+        InfoNCE 损失计算
+        """
+        v1_embs = self.proj(v1_embs)
+        v2_embs = self.proj(v2_embs)
 
-ASPS_FULL_ACTIVATION_EPOCH = int(WARMUP_EPOCHS + 0.5 * (NUM_EPOCHS - WARMUP_EPOCHS))
+        # 计算相似度矩阵
+        matrix_1to2 = self.sim(v1_embs, v2_embs)
 
-# ============================================================================
-# 修改的 get_contrast_pair_batch 函数（支持关闭ASPS）
-# ============================================================================
-def get_contrast_pair_batch_ablation(args, feat_sim, device, use_asps=True):
+        # 应用掩码: 正样本和负样本的相似度
+        pos_sim = (matrix_1to2 * pos).sum(dim=1)  # [batch_size]
+        neg_sim = (matrix_1to2 * neg).sum(dim=1)  # [batch_size]
+
+        # InfoNCE Loss
+        loss = -torch.log(pos_sim / (pos_sim + neg_sim + 1e-8) + 1e-8)
+
+        return loss.mean()
+
+
+# ==========================================
+# 2. 采样策略
+# ==========================================
+def get_contrast_pair_batch(batch_size, device):
     """
-    支持消融实验的对比样本生成函数
-    
-    Args:
-        use_asps: 如果为False，则使用固定的全负样本（不使用ASPS）
+    标准对比学习采样策略：
+    - 正样本 (Positive): 对角线 (自身与其他视图的自身)
+    - 负样本 (Negative): 除对角线外的所有样本
     """
-    batch_size = feat_sim.shape[0]
-    
-    # 基础正样本
+    # 1. 基础正样本 (Positive): 对角线
     pos = torch.eye(batch_size).to(device)
-    
-    # 基础负样本
-    neg_all = torch.ones_like(pos) - pos
-    
-    if not use_asps:
-        # 关闭ASPS: 直接使用所有负样本
-        return pos, neg_all
-    
-    # 使用ASPS策略
-    current_epoch = args.current_epoch if hasattr(args, 'current_epoch') else args['current_epoch']
-    total_epoch = args.epochs if hasattr(args, 'epochs') else args['epochs']
-    beta = args.beta if hasattr(args, 'beta') else 0.5
-    warmup_epochs = args.get('warmup_epochs', 5)
-    
-    max_neg_num = batch_size - 1
-    
-    if current_epoch <= warmup_epochs:
-        neg = neg_all
-    else:
-        progress = (current_epoch - warmup_epochs) / (total_epoch - warmup_epochs)
-        progress = max(0.0, min(1.0, progress))
-        
-        k_neg = int(max_neg_num * (progress ** 1.5) * beta)
-        k_neg = max(1, min(k_neg, max_neg_num))
-        
-        feat_sim_masked = feat_sim.clone()
-        feat_sim_masked.fill_diagonal_(-9e15)
-        
-        vals, indices = feat_sim_masked.topk(k=k_neg, dim=1, largest=True)
-        
-        hard_neg_mask = torch.zeros_like(feat_sim).to(device)
-        hard_neg_mask.scatter_(1, indices, 1)
-        
-        alpha = min(progress * 2, 1.0)
-        neg = alpha * hard_neg_mask + (1 - alpha) * neg_all
-    
-    neg = neg * (1 - pos)
+
+    # 2. 基础负样本 (Negative): 所有非对角线
+    neg = torch.ones(batch_size, batch_size).to(device) - pos
+
     return pos, neg
 
-# ============================================================================
-# 训练函数
-# ============================================================================
-def get_contrastive_weight(epoch, warmup_epochs=5):
-    if epoch <= warmup_epochs:
-        progress = epoch / warmup_epochs
-        return 0.5 * (1 - np.cos(np.pi * progress))
-    return 1.0
 
-def train(model, device, train_loader, optimizer, epoch, config):
+# ==========================================
+# 3. 消融实验模型 (AttnFusionGCNNet_Ablation)
+# ==========================================
+class AttnFusionGCNNet_Ablation(torch.nn.Module):
     """
-    支持消融实验的训练函数
-    
-    Args:
-        config: 消融实验配置字典
+    支持以下消融模式:
+    - 'full': 完整模型
+    - 'no_mirna_seq': 消融miRNA序列特征 (m1)
+    - 'no_mirna_cgr': 消融miRNA CGR特征 (m2)
+    - 'no_drug_seq': 消融drug序列特征 (d1)
+    - 'no_drug_fp': 消融drug指纹特征 (d2)
+    - 'no_attention': 消融交叉注意力
+    - 'no_contrastive': 消融协同对比学习
     """
-    model.train()
-    total_loss = 0
-    batch_count = 0
-    
-    use_contrastive = config["use_contrastive"]
-    use_asps = config["use_asps"]
-    
-    contrastive_weight_factor = get_contrastive_weight(epoch, WARMUP_EPOCHS) if use_contrastive else 0.0
+    def __init__(self, ablation_mode='full', n_output=1, n_filters=32, embed_dim=64, 
+                 num_features_xd=78, num_features_smile=66, num_features_xt=25, 
+                 output_dim=128, dropout=0.2, contrastive_dim=128, temperature=0.1, lam=0.5):
+        super(AttnFusionGCNNet_Ablation, self).__init__()
 
-    for batch_idx, data in enumerate(train_loader):
-        optimizer.zero_grad()
-        data = data.to(device)
-
-        # 根据配置决定是否返回对比学习损失，并传递use_asps参数
-        if use_contrastive:
-            output, loss_dict = model(
-                data,
-                current_epoch=epoch,
-                total_epochs=NUM_EPOCHS,
-                warmup_epochs=WARMUP_EPOCHS,
-                return_contrastive_loss=True,
-                use_asps=use_asps
-            )
-        else:
-            output = model(
-                data,
-                current_epoch=epoch,
-                total_epochs=NUM_EPOCHS,
-                warmup_epochs=WARMUP_EPOCHS,
-                return_contrastive_loss=False,
-                use_asps=use_asps
-            )
-            loss_dict = None
-
-        labels = data.y.view(-1, 1).float().to(device)
-        output = output.view(-1, 1)
-        output = torch.clamp(output, min=1e-7, max=1.0 - 1e-7)
+        self.ablation_mode = ablation_mode
+        self.n_output = n_output
+        self.output_dim = output_dim
+        self.contrastive_dim = contrastive_dim
         
-        loss_bce = loss_fn(output, labels)
+        # Embedding 参数
+        self.max_smile_idx = num_features_smile
+        self.max_target_idx = num_features_xt
+        self.smile_embed = nn.Embedding(num_features_smile + 1, embed_dim)
+
+        # ============ Drug Encoders ============
+        # CNN Branch 1
+        self.conv_xd_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
+        self.conv_xd_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=3, padding=1)
+        # CNN Branch 2
+        self.conv_xd_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
+        self.conv_xd_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
+        # CNN Branch 3
+        self.conv_xd_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=1, padding=1)
+        self.conv_xd_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=1, padding=1)
+
+        self.fc_smiles = nn.Linear(n_filters * 2, output_dim)
+
+        # Drug Fingerprint components
+        self.rdkit_descriptor_dim = 210
+        self.rdkit_fingerprint_dim = 136
+        self.maccs_dim = 166
+        self.morgan_dim = 512
+        self.combined_dim = 1024
+        self.attention_rdkit_descriptor = nn.Linear(self.rdkit_descriptor_dim, self.rdkit_descriptor_dim)
+        self.attention_maccs = nn.Linear(self.maccs_dim, self.maccs_dim)
+        self.drug_fingerprint_transform = nn.Linear(self.combined_dim, output_dim)
+
+        # Drug Feature Fusion
+        self.drug_attn = nn.MultiheadAttention(embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.1)
+        self.layer_norm_drug = nn.LayerNorm(output_dim, eps=1e-3)
+        self.relu = nn.LeakyReLU(0.01)
+        self.dropout = nn.Dropout(dropout)
+
+        self.fusion_drug_final = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            self.relu,
+            self.dropout
+        )
+
+        self.conv_reduce_smiles = nn.Conv1d(in_channels=output_dim * 3, out_channels=output_dim, kernel_size=1)
+        self.conv_reduce_xt = nn.Conv1d(in_channels=192, out_channels=output_dim, kernel_size=1)
+
+        # ============ miRNA Encoders ============
+        self.embedding_xt = nn.Embedding(num_features_xt + 1, embed_dim)
+
+        # 1. miRNA Sequence CNNs
+        self.conv_xt_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=4, padding=2)
+        self.conv_xt_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=4, padding=2)
+        self.conv_xt_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
+        self.conv_xt_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=3, padding=1)
+        self.conv_xt_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
+        self.conv_xt_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
+
+        # 2. miRNA Matrix CNNs
+        self.conv_matrix_1 = nn.Conv2d(1, n_filters, kernel_size=3, padding=1)
+        self.conv_matrix_2 = nn.Conv2d(n_filters, n_filters * 2, kernel_size=3, padding=1)
+        self.conv_matrix_3 = nn.Conv2d(n_filters * 2, n_filters * 4, kernel_size=3, padding=1)
         
-        # 计算总损失
-        if use_contrastive and loss_dict is not None:
-            loss_mirna_contrastive = loss_dict['contrastive_mirna']
-            loss_drug_contrastive = loss_dict['contrastive_drug']
-            
-            loss = (GAMMA * loss_bce +
-                    contrastive_weight_factor * (ALPHA * loss_mirna_contrastive +
-                                                 BETA * loss_drug_contrastive))
-        else:
-            # 只使用BCE损失
-            loss = loss_bce
+        self.flatten_dim = (n_filters * 4) * 4 * 4
+        
+        self.fc_matrix_1 = nn.Linear(self.flatten_dim, 256)
+        self.fc_matrix_2 = nn.Linear(256, output_dim)
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n[Error] Loss is NaN/Inf at Epoch {epoch}, Batch {batch_idx}")
-            return None
+        # miRNA Attention
+        self.mirna_attn = nn.MultiheadAttention(embed_dim=output_dim, num_heads=8, batch_first=True, dropout=0.05)
+        self.layer_norm_mirna = nn.LayerNorm(output_dim, eps=1e-3)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        optimizer.step()
+        self.fusion_mirna_final = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),
+            self.relu,
+            self.dropout
+        )
 
-        total_loss += loss.item()
-        batch_count += 1
+        # ============ 对比学习模块 ============
+        self.contrast_drug = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
+        self.contrast_mirna = Model_Contrast(hidden_dim=output_dim, tau=temperature, lam=lam)
 
-    return total_loss / batch_count
+        # Final layers
+        self.fc1 = nn.Linear(output_dim * 2, 256)
+        self.out = nn.Linear(256, self.n_output)
+        self.ac = nn.Sigmoid()
 
-def predicting(model, device, loader):
-    model.eval()
-    total_probs = []
-    total_labels = []
+    def process_drug_fingerprints(self, rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint):
+        if len(rdkit_descriptor.shape) == 1: rdkit_descriptor = rdkit_descriptor.unsqueeze(0)
+        if len(rdkit_fingerprint.shape) == 1: rdkit_fingerprint = rdkit_fingerprint.unsqueeze(0)
+        if len(maccs_fingerprint.shape) == 1: maccs_fingerprint = maccs_fingerprint.unsqueeze(0)
+        if len(morgan_fingerprint.shape) == 1: morgan_fingerprint = morgan_fingerprint.unsqueeze(0)
 
-    with torch.no_grad():
-        for data in loader:
-            data = data.to(device)
-            output = model(
-                data,
-                current_epoch=0,
-                total_epochs=NUM_EPOCHS,
-                warmup_epochs=WARMUP_EPOCHS,
-                return_contrastive_loss=False
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            if len(rdkit_descriptor.shape) > 2: rdkit_descriptor = rdkit_descriptor.mean(dim=1)
+            if len(rdkit_fingerprint.shape) > 2: rdkit_fingerprint = rdkit_fingerprint.mean(dim=1)
+            if len(maccs_fingerprint.shape) > 2: maccs_fingerprint = maccs_fingerprint.mean(dim=1)
+            if len(morgan_fingerprint.shape) > 2: morgan_fingerprint = morgan_fingerprint.mean(dim=1)
+
+        attention_weights_rdkit = self.attention_rdkit_descriptor(rdkit_descriptor)
+        attention_weights_rdkit = F.softmax(attention_weights_rdkit, dim=-1)
+        rdkit_descriptor_prime = rdkit_descriptor * attention_weights_rdkit
+
+        attention_weights_maccs = self.attention_maccs(maccs_fingerprint)
+        attention_weights_maccs = F.softmax(attention_weights_maccs, dim=-1)
+        maccs_prime = maccs_fingerprint * attention_weights_maccs
+
+        combined_features = torch.cat([
+            rdkit_descriptor_prime,
+            maccs_prime,
+            rdkit_fingerprint,
+            morgan_fingerprint
+        ], dim=-1)
+
+        drug_features = self.drug_fingerprint_transform(combined_features)
+        drug_features = self.relu(drug_features)
+        drug_features = self.dropout(drug_features)
+        drug_features = torch.nan_to_num(drug_features, nan=0.0, posinf=0.0, neginf=0.0)
+        return drug_features
+
+    def forward(self, data, current_epoch=0, total_epochs=100, warmup_epochs=5, return_contrastive_loss=True):
+        # ============= Data Loading & Preprocessing =============
+        rdkit_fingerprint = data.rdkit_fingerprint
+        rdkit_descriptor = data.rdkit_descriptor
+        maccs_fingerprint = data.maccs_fingerprint
+        morgan_fingerprint = data.morgan_fingerprint
+        drugsmile = data.seqdrug
+        target = data.target
+        target_matrix = data.target_matrix if hasattr(data, 'target_matrix') else None
+
+        if target_matrix is None: raise ValueError("target_matrix is None.")
+
+        if drugsmile.dtype == torch.float32 or drugsmile.dtype == torch.float64: drugsmile = drugsmile.long()
+        if target.dtype == torch.float32 or target.dtype == torch.float64: target = target.long()
+        drugsmile = torch.clamp(drugsmile, 0, self.max_smile_idx)
+        target = torch.clamp(target, 0, self.max_target_idx)
+        batch_size = drugsmile.shape[0]
+
+        rdkit_descriptor = rdkit_descriptor.view(batch_size, self.rdkit_descriptor_dim)
+        rdkit_fingerprint = rdkit_fingerprint.view(batch_size, self.rdkit_fingerprint_dim)
+        maccs_fingerprint = maccs_fingerprint.view(batch_size, self.maccs_dim)
+        morgan_fingerprint = morgan_fingerprint.view(batch_size, self.morgan_dim)
+
+        rdkit_descriptor = torch.nan_to_num(rdkit_descriptor, nan=0.0)
+        rdkit_fingerprint = torch.nan_to_num(rdkit_fingerprint, nan=0.0)
+        maccs_fingerprint = torch.nan_to_num(maccs_fingerprint, nan=0.0)
+        morgan_fingerprint = torch.nan_to_num(morgan_fingerprint, nan=0.0)
+        target_matrix = torch.nan_to_num(target_matrix, nan=0.0)
+
+        # ============= Drug Processing =============
+        # Drug Fingerprint Features (d2)
+        use_drug_fp = self.ablation_mode != 'no_drug_fp'
+        if use_drug_fp:
+            fingerprint_features = self.process_drug_fingerprints(
+                rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint
             )
-            probs = output.cpu().numpy().flatten()
-            total_probs.extend(probs)
-            total_labels.extend(data.y.view(-1, 1).cpu().numpy().flatten())
+            drug_mol_features = fingerprint_features
+        else:
+            drug_mol_features = None
 
-    total_probs = np.array(total_probs)
-    total_labels = np.array(total_labels)
-    total_preds = (total_probs >= 0.5).astype(int)
+        # Drug Sequence Features (d1)
+        use_drug_seq = self.ablation_mode != 'no_drug_seq'
+        if use_drug_seq:
+            embedded_smile = self.smile_embed(drugsmile).permute(0, 2, 1)
+            conv_xd1 = self.conv_xd_11(embedded_smile)
+            conv_xd1 = self.relu(conv_xd1)
+            conv_xd1 = self.dropout(conv_xd1)
+            conv_xd1 = F.max_pool1d(conv_xd1, kernel_size=2)
+            conv_xd1 = self.conv_xd_12(conv_xd1)
+            conv_xd1 = self.relu(conv_xd1)
+            conv_xd1 = F.max_pool1d(conv_xd1, conv_xd1.size(2)).squeeze(2)
 
-    accuracy = accuracy_score(total_labels, total_preds)
-    precision = precision_score(total_labels, total_preds, zero_division=0)
-    recall = recall_score(total_labels, total_preds, zero_division=0)
-    f1 = f1_score(total_labels, total_preds, zero_division=0)
+            conv_xd2 = self.conv_xd_21(embedded_smile)
+            conv_xd2 = self.relu(conv_xd2)
+            conv_xd2 = self.dropout(conv_xd2)
+            conv_xd2 = F.max_pool1d(conv_xd2, kernel_size=2)
+            conv_xd2 = self.conv_xd_22(conv_xd2)
+            conv_xd2 = self.relu(conv_xd2)
+            conv_xd2 = self.dropout(conv_xd2)
+            conv_xd2 = F.max_pool1d(conv_xd2, conv_xd2.size(2)).squeeze(2)
 
-    try:
-        roc_auc = roc_auc_score(total_labels, total_probs)
-    except ValueError:
-        roc_auc = 0.5
+            conv_xd3 = self.conv_xd_31(embedded_smile)
+            conv_xd3 = self.relu(conv_xd3)
+            conv_xd3 = self.dropout(conv_xd3)
+            conv_xd3 = F.max_pool1d(conv_xd3, kernel_size=2)
+            conv_xd3 = self.conv_xd_32(conv_xd3)
+            conv_xd3 = self.relu(conv_xd3)
+            conv_xd3 = F.max_pool1d(conv_xd3, conv_xd3.size(2)).squeeze(2)
 
-    precision_vals, recall_vals, _ = precision_recall_curve(total_labels, total_probs)
-    pr_auc = auc(recall_vals, precision_vals)
+            conv_xd1 = self.fc_smiles(conv_xd1)
+            conv_xd2 = self.fc_smiles(conv_xd2)
+            conv_xd3 = self.fc_smiles(conv_xd3)
 
-    return accuracy, precision, recall, f1, roc_auc, pr_auc
+            conv_xd = torch.cat((conv_xd1, conv_xd2, conv_xd3), dim=1).unsqueeze(1).permute(0, 2, 1)
+            conv_xd = self.conv_reduce_smiles(conv_xd).squeeze(2)
+            conv_xd = torch.nan_to_num(conv_xd, nan=0.0)
+            drug_seq_features = conv_xd
+        else:
+            drug_seq_features = None
 
-# ============================================================================
-# 运行单个消融实验
-# ============================================================================
-def run_ablation_experiment(config_name, config, device):
-    """运行单个消融实验配置"""
-    
-    print(f"\n{'='*80}")
-    print(f"🔬 Ablation Experiment: {config_name.upper()}")
-    print(f"📋 Configuration: {config['description']}")
-    print(f"   - Use Contrastive Learning: {config['use_contrastive']}")
-    print(f"   - Use ASPS: {config['use_asps']}")
-    print(f"{'='*80}\n")
-    
-    metrics_history = {
-        'acc': [], 'prec': [], 'rec': [], 'f1': [], 'auc': [], 'pr_auc': []
-    }
-
-    for fold in range(NUM_FOLDS):
-        print(f"\n{'='*70}")
-        print(f">>> Fold {fold + 1}/{NUM_FOLDS}")
-        print(f"{'='*70}")
-
-        train_data = TestbedDataset(root='data', dataset='train' + str(fold))
-        test_data = TestbedDataset(root='data', dataset='test' + str(fold))
-
-        train_loader = DataLoader(train_data, batch_size=TRAIN_BATCH_SIZE, shuffle=True, drop_last=True)
-        test_loader = DataLoader(test_data, batch_size=TEST_BATCH_SIZE, shuffle=False, drop_last=False)
-
-        model = AttnFusionGCNNet(
-            n_output=1, n_filters=32, embed_dim=64, num_features_xd=78,
-            num_features_smile=66, num_features_xt=25, output_dim=128, dropout=0.2,
-            contrastive_dim=CONTRASTIVE_DIM, temperature=TEMPERATURE, lam=LAM
-        ).to(device)
-
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=LR * 0.01)
-
-        # 训练循环
-        for epoch in range(1, NUM_EPOCHS + 1):
-            loss_val = train(model, device, train_loader, optimizer, epoch, config)
-            if loss_val is None:
-                break
-
-            scheduler.step()
-            acc, prec, rec, f1, auc_score, pr_auc_score = predicting(model, device, test_loader)
-            
-            # 显示训练阶段
-            if epoch <= WARMUP_EPOCHS:
-                phase = "Warmup"
-            elif config['use_asps'] and epoch < ASPS_FULL_ACTIVATION_EPOCH:
-                phase = f"ASPS Ramping"
+        # Drug Feature Fusion
+        use_attention = self.ablation_mode != 'no_attention'
+        
+        if use_drug_seq and use_drug_fp:
+            if use_attention:
+                # 使用交叉注意力融合
+                smiles_unsq = conv_xd.unsqueeze(1)
+                fingerprint_unsq = fingerprint_features.unsqueeze(1)
+                attn_out, _ = self.drug_attn(query=smiles_unsq, key=fingerprint_unsq, value=fingerprint_unsq)
+                attn_out = torch.nan_to_num(attn_out.squeeze(1), nan=0.0)
+                residual_in_drug = attn_out + conv_xd
+                drug_features_attn = self.layer_norm_drug(residual_in_drug)
+                drug_concat = torch.cat([drug_features_attn, fingerprint_features], dim=1)
+                drug_features = self.fusion_drug_final(drug_concat)
             else:
-                phase = "Training"
+                # 不使用注意力，直接拼接
+                drug_concat = torch.cat([conv_xd, fingerprint_features], dim=1)
+                drug_features = self.fusion_drug_final(drug_concat)
+        elif use_drug_seq:
+            # 只有序列特征
+            drug_features = conv_xd
+        elif use_drug_fp:
+            # 只有指纹特征
+            drug_features = fingerprint_features
+        else:
+            raise ValueError("At least one drug feature must be enabled")
+
+        # ============= miRNA Processing =============
+        # miRNA Sequence Features (m1)
+        use_mirna_seq = self.ablation_mode != 'no_mirna_seq'
+        if use_mirna_seq:
+            embedded_xt = self.embedding_xt(target).permute(0, 2, 1)
+            conv_xt1 = self.conv_xt_11(embedded_xt)
+            conv_xt1 = self.relu(conv_xt1)
+            conv_xt1 = self.dropout(conv_xt1)
+            conv_xt1 = self.conv_xt_12(conv_xt1)
+            conv_xt1 = self.relu(conv_xt1)
+            conv_xt1 = F.max_pool1d(conv_xt1, conv_xt1.size(2)).squeeze(2)
+
+            conv_xt2 = self.conv_xt_21(embedded_xt)
+            conv_xt2 = self.relu(conv_xt2)
+            conv_xt2 = self.dropout(conv_xt2)
+            conv_xt2 = self.conv_xt_22(conv_xt2)
+            conv_xt2 = self.relu(conv_xt2)
+            conv_xt2 = F.max_pool1d(conv_xt2, conv_xt2.size(2)).squeeze(2)
+
+            conv_xt3 = self.conv_xt_31(embedded_xt)
+            conv_xt3 = self.relu(conv_xt3)
+            conv_xt3 = self.dropout(conv_xt3)
+            conv_xt3 = F.max_pool1d(conv_xt3, kernel_size=2)
+            conv_xt3 = self.conv_xt_32(conv_xt3)
+            conv_xt3 = self.relu(conv_xt3)
+            conv_xt3 = F.max_pool1d(conv_xt3, conv_xt3.size(2)).squeeze(2)
+
+            conv_xt = torch.cat((conv_xt1, conv_xt2, conv_xt3), dim=1).unsqueeze(2)
+            conv_xt = self.conv_reduce_xt(conv_xt).squeeze(2)
+            conv_xt = torch.nan_to_num(conv_xt, nan=0.0)
+            mirna_seq_features = conv_xt
+        else:
+            mirna_seq_features = None
+
+        # miRNA CGR Features (m2)
+        use_mirna_cgr = self.ablation_mode != 'no_mirna_cgr'
+        if use_mirna_cgr:
+            if len(target_matrix.shape) == 3: target_matrix = target_matrix.unsqueeze(1)
             
-            if epoch % 5 == 0 or epoch == NUM_EPOCHS:
-                print(f'Epoch {epoch:03d} [{phase}]: Loss={loss_val:.5f} | Val AUC={auc_score:.5f}')
+            matrix_feat = self.conv_matrix_1(target_matrix)
+            matrix_feat = self.relu(matrix_feat)
+            matrix_feat = F.max_pool2d(matrix_feat, kernel_size=2)
+            
+            matrix_feat = self.conv_matrix_2(matrix_feat)
+            matrix_feat = self.relu(matrix_feat)
+            matrix_feat = F.max_pool2d(matrix_feat, kernel_size=2)
+            
+            matrix_feat = self.conv_matrix_3(matrix_feat)
+            matrix_feat = self.relu(matrix_feat)
+            matrix_feat = self.dropout(matrix_feat)
+            
+            matrix_feat = matrix_feat.view(matrix_feat.size(0), -1)
+            matrix_feat = self.fc_matrix_1(matrix_feat)
+            matrix_feat = self.relu(matrix_feat)
+            matrix_feat = self.dropout(matrix_feat)
+            matrix_feat = self.fc_matrix_2(matrix_feat)
+            matrix_feat = torch.nan_to_num(matrix_feat, nan=0.0)
+            mirna_cgr_features = matrix_feat
+        else:
+            mirna_cgr_features = None
 
-        # 最终评估
-        print(f"\n使用最后一轮 (Epoch {NUM_EPOCHS}) 的模型进行最终评估...")
-        acc, prec, rec, f1, auc_score, pr_auc_score = predicting(model, device, test_loader)
+        # miRNA Feature Fusion
+        if use_mirna_seq and use_mirna_cgr:
+            if use_attention:
+                # 使用交叉注意力融合
+                xt_unsq = conv_xt.unsqueeze(1)
+                mat_unsq = matrix_feat.unsqueeze(1)
+                attn_out_m, _ = self.mirna_attn(query=xt_unsq, key=mat_unsq, value=mat_unsq)
+                attn_out_m = torch.nan_to_num(attn_out_m.squeeze(1), nan=0.0)
+                residual_in_mirna = attn_out_m + conv_xt
+                mirna_features_attn = self.layer_norm_mirna(residual_in_mirna)
+                mirna_concat = torch.cat([mirna_features_attn, matrix_feat], dim=1)
+                mirna_features = self.fusion_mirna_final(mirna_concat)
+            else:
+                # 不使用注意力，直接拼接
+                mirna_concat = torch.cat([conv_xt, matrix_feat], dim=1)
+                mirna_features = self.fusion_mirna_final(mirna_concat)
+        elif use_mirna_seq:
+            # 只有序列特征
+            mirna_features = conv_xt
+        elif use_mirna_cgr:
+            # 只有CGR特征
+            mirna_features = matrix_feat
+        else:
+            raise ValueError("At least one miRNA feature must be enabled")
 
-        metrics_history['acc'].append(acc)
-        metrics_history['prec'].append(prec)
-        metrics_history['rec'].append(rec)
-        metrics_history['f1'].append(f1)
-        metrics_history['auc'].append(auc_score)
-        metrics_history['pr_auc'].append(pr_auc_score)
+        # ============= Final Prediction =============
+        xc = torch.cat((drug_features, mirna_features), dim=1)
+        xc = self.fc1(xc)
+        xc = self.relu(xc)
+        xc = self.dropout(xc)
+        out = self.out(xc)
+        out = self.ac(out)
 
-        print(f"Fold {fold + 1} Final Result → AUC: {auc_score:.4f}, AUPR: {pr_auc_score:.4f}")
+        # ============= Contrastive Loss =============
+        if return_contrastive_loss and self.ablation_mode != 'no_contrastive':
+            # 准备对比学习特征
+            mirna_seq_norm = F.normalize(mirna_seq_features, dim=1) if use_mirna_seq else None
+            mirna_cgr_norm = F.normalize(mirna_cgr_features, dim=1) if use_mirna_cgr else None
+            mirna_fused_norm = F.normalize(mirna_features, dim=1)
 
-    return metrics_history
+            drug_seq_norm = F.normalize(drug_seq_features, dim=1) if use_drug_seq else None
+            drug_mol_norm = F.normalize(drug_mol_features, dim=1) if use_drug_fp else None
+            drug_fused_norm = F.normalize(drug_features, dim=1)
 
-# ============================================================================
-# 主程序 - 运行所有消融实验
-# ============================================================================
-if __name__ == "__main__":
-    cuda_name = "cuda:0"
-    if len(sys.argv) > 1:
-        cuda_name = "cuda:" + str(int(sys.argv[1]))
+            # 标准采样
+            pos_mask, neg_mask = get_contrast_pair_batch(batch_size, data.target.device)
 
-    device = torch.device(cuda_name if torch.cuda.is_available() else "cpu")
-    print(f'Using device: {device}\n')
-    
-    # 存储所有实验结果
-    all_results = {}
-    
-    # 运行所有消融实验
-    for config_name, config in ABLATION_CONFIGS.items():
-        results = run_ablation_experiment(config_name, config, device)
-        all_results[config_name] = results
-    
-    # ============================================================================
-    # 📊 打印汇总结果对比表
-    # ============================================================================
-    print("\n" + "="*100)
-    print("📊 ABLATION STUDY RESULTS SUMMARY")
-    print("="*100)
-    
-    print(f"\n{'Configuration':<30} {'AUC':<20} {'AUPR':<20} {'Accuracy':<20}")
-    print("-"*100)
-    
-    for config_name, config in ABLATION_CONFIGS.items():
-        results = all_results[config_name]
-        auc_mean = np.mean(results['auc'])
-        auc_std = np.std(results['auc'])
-        aupr_mean = np.mean(results['pr_auc'])
-        aupr_std = np.std(results['pr_auc'])
-        acc_mean = np.mean(results['acc'])
-        acc_std = np.std(results['acc'])
-        
-        print(f"{config['description']:<30} "
-              f"{auc_mean:.4f}±{auc_std:.4f}    "
-              f"{aupr_mean:.4f}±{aupr_std:.4f}    "
-              f"{acc_mean:.4f}±{acc_std:.4f}")
-    
-    print("="*100)
-    
-    # ============================================================================
-    # 📈 计算性能提升百分比
-    # ============================================================================
-    print("\n" + "="*100)
-    print("📈 PERFORMANCE IMPROVEMENT ANALYSIS (vs Baseline)")
-    print("="*100)
-    
-    baseline_auc = np.mean(all_results['baseline']['auc'])
-    baseline_aupr = np.mean(all_results['baseline']['pr_auc'])
-    
-    print(f"\n{'Configuration':<30} {'AUC Improvement':<25} {'AUPR Improvement':<25}")
-    print("-"*100)
-    
-    for config_name, config in ABLATION_CONFIGS.items():
-        if config_name == 'baseline':
-            continue
-        
-        results = all_results[config_name]
-        auc_mean = np.mean(results['auc'])
-        aupr_mean = np.mean(results['pr_auc'])
-        
-        auc_improvement = ((auc_mean - baseline_auc) / baseline_auc) * 100
-        aupr_improvement = ((aupr_mean - baseline_aupr) / baseline_aupr) * 100
-        
-        print(f"{config['description']:<30} "
-              f"{auc_improvement:+.2f}%                 "
-              f"{aupr_improvement:+.2f}%")
-    
-    print("="*100)
-    
-    # ============================================================================
-    # 💾 保存结果到JSON文件
-    # ============================================================================
-    results_summary = {}
-    for config_name, config in ABLATION_CONFIGS.items():
-        results = all_results[config_name]
-        results_summary[config_name] = {
-            'description': config['description'],
-            'use_contrastive': config['use_contrastive'],
-            'use_asps': config['use_asps'],
-            'metrics': {
-                'auc': {
-                    'mean': float(np.mean(results['auc'])),
-                    'std': float(np.std(results['auc'])),
-                    'values': [float(x) for x in results['auc']]
-                },
-                'aupr': {
-                    'mean': float(np.mean(results['pr_auc'])),
-                    'std': float(np.std(results['pr_auc'])),
-                    'values': [float(x) for x in results['pr_auc']]
-                },
-                'accuracy': {
-                    'mean': float(np.mean(results['acc'])),
-                    'std': float(np.std(results['acc'])),
-                    'values': [float(x) for x in results['acc']]
-                }
+            # 计算对比损失
+            loss_mirna_contrastive = 0.0
+            if use_mirna_seq:
+                loss_mirna_seq = self.contrast_mirna(mirna_seq_norm, mirna_fused_norm, pos_mask, neg_mask)
+                loss_mirna_contrastive += loss_mirna_seq
+            if use_mirna_cgr:
+                loss_mirna_cgr = self.contrast_mirna(mirna_cgr_norm, mirna_fused_norm, pos_mask, neg_mask)
+                loss_mirna_contrastive += loss_mirna_cgr
+
+            loss_drug_contrastive = 0.0
+            if use_drug_seq:
+                loss_drug_seq = self.contrast_drug(drug_seq_norm, drug_fused_norm, pos_mask, neg_mask)
+                loss_drug_contrastive += loss_drug_seq
+            if use_drug_fp:
+                loss_drug_mol = self.contrast_drug(drug_mol_norm, drug_fused_norm, pos_mask, neg_mask)
+                loss_drug_contrastive += loss_drug_mol
+
+            loss_dict = {
+                'contrastive_mirna': loss_mirna_contrastive,
+                'contrastive_drug': loss_drug_contrastive,
             }
-        }
-    
-    with open('ablation_results.json', 'w') as f:
-        json.dump(results_summary, f, indent=4)
-    
-    print(f"\n✅ Results saved to 'ablation_results.json'")
-    print("\n" + "="*100)
+
+            return out, loss_dict
+
+        # 如果消融对比学习，返回空字典
+        if return_contrastive_loss:
+            loss_dict = {
+                'contrastive_mirna': torch.tensor(0.0).to(out.device),
+                'contrastive_drug': torch.tensor(0.0).to(out.device),
+            }
+            return out, loss_dict
+
+        return out
