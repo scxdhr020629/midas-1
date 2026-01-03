@@ -79,42 +79,42 @@ def generate_cgr_matrix(sequence, k=4, bases=["A", "C", "G", "U"], smoothing_alp
 # print(mat)
 
 
-# --- 测试设置 ---
-seq = "UGCA"    
-k = 4          # 矩阵大小为 2^2 = 4x4
-smoothing_alpha = 1.0 
-mat = generate_cgr_matrix(seq, k=k, smoothing_alpha=smoothing_alpha)
+# # --- 测试设置 ---
+# seq = "UGCA"    
+# k = 4          # 矩阵大小为 2^2 = 4x4
+# smoothing_alpha = 1.0 
+# mat = generate_cgr_matrix(seq, k=k, smoothing_alpha=smoothing_alpha)
 
-# --- 增强可视化部分 ---
-plt.figure(figsize=(8, 8))
+# # --- 增强可视化部分 ---
+# plt.figure(figsize=(8, 8))
 
-# 1. 绘制热力图 (origin='upper' 符合矩阵直觉：(0,0)在左上角)
-im = plt.imshow(mat, cmap='viridis', origin='upper')
+# # 1. 绘制热力图 (origin='upper' 符合矩阵直觉：(0,0)在左上角)
+# im = plt.imshow(mat, cmap='viridis', origin='upper')
 
-# 2. 设置标题和颜色条
-plt.title(f'FCGR Matrix (k={k}, Sequence="{seq}")\nValue shows Probability', fontsize=14)
-plt.colorbar(im, fraction=0.046, pad=0.04, label='Probability')
+# # 2. 设置标题和颜色条
+# plt.title(f'FCGR Matrix (k={k}, Sequence="{seq}")\nValue shows Probability', fontsize=14)
+# plt.colorbar(im, fraction=0.046, pad=0.04, label='Probability')
 
-# 3. 核心修改：在每个格子里填上具体的数值
-# 只有当矩阵较小 (k<=5) 时才显示数字，否则字太密看不清
-if k <= 5:
-    for i in range(mat.shape[0]):      # 遍历行 (Y轴)
-        for j in range(mat.shape[1]):  # 遍历列 (X轴)
-            # 只有数值 > 0.06 (背景底色) 才标红/标白，方便区分
-            text_color = "white" if mat[i, j] < mat.max()/2 else "black"
-            plt.text(j, i, f'{mat[i, j]:.3f}', 
-                     ha="center", va="center", color=text_color, fontsize=10)
+# # 3. 核心修改：在每个格子里填上具体的数值
+# # 只有当矩阵较小 (k<=5) 时才显示数字，否则字太密看不清
+# if k <= 5:
+#     for i in range(mat.shape[0]):      # 遍历行 (Y轴)
+#         for j in range(mat.shape[1]):  # 遍历列 (X轴)
+#             # 只有数值 > 0.06 (背景底色) 才标红/标白，方便区分
+#             text_color = "white" if mat[i, j] < mat.max()/2 else "black"
+#             plt.text(j, i, f'{mat[i, j]:.3f}', 
+#                      ha="center", va="center", color=text_color, fontsize=10)
 
-# 4. 核心修改：搞清楚坐标轴是什么
-# 生成二进制标签，例如 k=2 时生成 ['00', '01', '10', '11']
-ticks = np.arange(2**k)
-binary_labels = [format(i, f'0{k}b') for i in ticks]
+# # 4. 核心修改：搞清楚坐标轴是什么
+# # 生成二进制标签，例如 k=2 时生成 ['00', '01', '10', '11']
+# ticks = np.arange(2**k)
+# binary_labels = [format(i, f'0{k}b') for i in ticks]
 
-plt.xticks(ticks, binary_labels)
-plt.yticks(ticks, binary_labels)
+# plt.xticks(ticks, binary_labels)
+# plt.yticks(ticks, binary_labels)
 
-plt.xlabel(f'Column Index (Binary)\n0=A/U, 1=C/G\n(Left to Right)', fontsize=12)
-plt.ylabel(f'Row Index (Binary)\n0=A/C, 1=G/U\n(Top to Bottom)', fontsize=12)
+# plt.xlabel(f'Column Index (Binary)\n0=A/U, 1=C/G\n(Left to Right)', fontsize=12)
+# plt.ylabel(f'Row Index (Binary)\n0=A/C, 1=G/U\n(Top to Bottom)', fontsize=12)
 
-plt.tight_layout()
-plt.show()
+# plt.tight_layout()
+# plt.show()

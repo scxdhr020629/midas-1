@@ -85,6 +85,8 @@ class AttnFusionGCNNet_Ablation(torch.nn.Module):
     - 'no_drug_fp': 消融drug指纹特征 (d2)
     - 'no_attention': 消融交叉注意力
     - 'no_contrastive': 消融协同对比学习
+    - 'no_mirna_seq_drug_seq': 同时消融miRNA序列和drug序列 (m1+d1)
+    - 'no_mirna_cgr_drug_fp': 同时消融miRNA CGR和drug指纹 (m2+d2)
     """
     def __init__(self, ablation_mode='full', n_output=1, n_filters=32, embed_dim=64, 
                  num_features_xd=78, num_features_smile=66, num_features_xt=25, 
@@ -242,9 +244,16 @@ class AttnFusionGCNNet_Ablation(torch.nn.Module):
         morgan_fingerprint = torch.nan_to_num(morgan_fingerprint, nan=0.0)
         target_matrix = torch.nan_to_num(target_matrix, nan=0.0)
 
+        # ============= 判断消融模式 =============
+        # 新增组合消融模式的判断
+        use_drug_fp = self.ablation_mode not in ['no_drug_fp', 'no_mirna_cgr_drug_fp']
+        use_drug_seq = self.ablation_mode not in ['no_drug_seq', 'no_mirna_seq_drug_seq']
+        use_mirna_seq = self.ablation_mode not in ['no_mirna_seq', 'no_mirna_seq_drug_seq']
+        use_mirna_cgr = self.ablation_mode not in ['no_mirna_cgr', 'no_mirna_cgr_drug_fp']
+        use_attention = self.ablation_mode != 'no_attention'
+
         # ============= Drug Processing =============
         # Drug Fingerprint Features (d2)
-        use_drug_fp = self.ablation_mode != 'no_drug_fp'
         if use_drug_fp:
             fingerprint_features = self.process_drug_fingerprints(
                 rdkit_descriptor, rdkit_fingerprint, maccs_fingerprint, morgan_fingerprint
@@ -254,7 +263,6 @@ class AttnFusionGCNNet_Ablation(torch.nn.Module):
             drug_mol_features = None
 
         # Drug Sequence Features (d1)
-        use_drug_seq = self.ablation_mode != 'no_drug_seq'
         if use_drug_seq:
             embedded_smile = self.smile_embed(drugsmile).permute(0, 2, 1)
             conv_xd1 = self.conv_xd_11(embedded_smile)
@@ -294,8 +302,6 @@ class AttnFusionGCNNet_Ablation(torch.nn.Module):
             drug_seq_features = None
 
         # Drug Feature Fusion
-        use_attention = self.ablation_mode != 'no_attention'
-        
         if use_drug_seq and use_drug_fp:
             if use_attention:
                 # 使用交叉注意力融合
@@ -322,7 +328,6 @@ class AttnFusionGCNNet_Ablation(torch.nn.Module):
 
         # ============= miRNA Processing =============
         # miRNA Sequence Features (m1)
-        use_mirna_seq = self.ablation_mode != 'no_mirna_seq'
         if use_mirna_seq:
             embedded_xt = self.embedding_xt(target).permute(0, 2, 1)
             conv_xt1 = self.conv_xt_11(embedded_xt)
@@ -355,7 +360,6 @@ class AttnFusionGCNNet_Ablation(torch.nn.Module):
             mirna_seq_features = None
 
         # miRNA CGR Features (m2)
-        use_mirna_cgr = self.ablation_mode != 'no_mirna_cgr'
         if use_mirna_cgr:
             if len(target_matrix.shape) == 3: target_matrix = target_matrix.unsqueeze(1)
             
