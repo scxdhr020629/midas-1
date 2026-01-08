@@ -2,104 +2,111 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ==========================================
-# 1. 数据准备
+# 1. 全局数据与配置
 # ==========================================
-# 两个主组
 group_labels = ['AUC', 'AUPR']
-
-# 7个变体名称
-# model_names = ['MDCL', 'w/o MS', 'w/o MC', 'w/o DS', 'w/o DF', 'w/o CA', 'w/o CCL']
-#
-# # 数值数据
-# auc_data = [0.9478, 0.9387, 0.9462, 0.9442, 0.9439, 0.9467, 0.9440]
-# aupr_data = [0.9330, 0.9199, 0.9310, 0.9273, 0.9273, 0.9299, 0.9295]
-
-model_names = ['MDCL', 'w/o-SS', 'w/o-CF',  'w/o CA', 'w/o CCL']
-auc_data = [0.9478, 0.9385, 0.9421, 0.9386, 0.9373]
-aupr_data = [0.9330, 0.9192, 0.9254, 0.9226, 0.9191]
-
-
-# 指定颜色
-# colors = ['#D080A8', '#E0A0C0', '#9DD9F3', '#C1C2E1', '#C0D8A8', '#EDD2E5', '#C6C6C6']
+model_names = ['MDCL', 'w/o-SS', 'w/o-CF', 'w/o-CA', 'w/o-CCL']
 colors = ['#9DD9F3', '#C1C2E1', '#C0D8A8', '#EDD2E5', '#C6C6C6']
-# ==========================================
-# 2. 绘图参数设置
-# ==========================================
-x = np.arange(len(group_labels))  # X轴位置 [0, 1]
-total_width = 0.8                 # 一组柱子的总宽度
-n_bars = len(model_names)         # 7个柱子
-bar_width = total_width / n_bars  # 单个柱子的宽度
 
-# 创建画布，设置宽一点，方便横向排版
-fig, ax = plt.subplots(figsize=(12, 7), dpi=300)
+# --- MDR 数据 (左图) ---
+mdr_auc = [0.9478, 0.9385, 0.9421, 0.9386, 0.9373]
+mdr_aupr = [0.9330, 0.9192, 0.9254, 0.9226, 0.9191]
 
-# ==========================================
-# 3. 循环绘制柱子 & 添加数值标签
-# ==========================================
-for i in range(n_bars):
-    # 计算当前柱子的X坐标：
-    # x - (总宽/2) + (偏移量)
-    x_pos = x - (total_width / 2) + (i * bar_width) + (bar_width / 2)
-    
-    # 提取当前模型在 AUC 和 AUPR 的分数
-    scores = [auc_data[i], aupr_data[i]]
-    
-    # 绘制柱子
-    rects = ax.bar(x_pos, scores, 
-                   width=bar_width, 
-                   label=model_names[i], 
-                   color=colors[i], 
-                   edgecolor='white', 
-                   linewidth=0.5)
-    
-    # --- 核心仿照点：在柱子上方添加数值 ---
-    for rect in rects:
-        height = rect.get_height()
-        # 垂直显示数值，加上一点padding，字体设小一点以防重叠
-        ax.text(rect.get_x() + rect.get_width() / 2, height + 0.0005,
-                f'{height:.4f}', 
-                ha='center', va='bottom', 
-                fontsize=7.5,  # 字体大小，可根据需要调整
-                color='black') # 字体颜色
+# --- MDS 数据 (右图) ---
+mds_auc = [0.9377, 0.9267, 0.9320, 0.9307, 0.9280]
+mds_aupr = [0.9290, 0.9141, 0.9216, 0.9213, 0.9182]
+
 
 # ==========================================
-# 4. 样式美化 (仿照参考图)
+# 2. 绘图辅助函数
+# ==========================================
+def draw_subplot(ax, auc_vals, aupr_vals, ylim_range, label_text):
+    """
+    绘制单个子图的函数
+    """
+    x = np.arange(len(group_labels))
+    total_width = 0.8
+    n_bars = len(model_names)
+    bar_width = total_width / n_bars
+
+    # 循环绘制柱子
+    for i in range(n_bars):
+        x_pos = x - (total_width / 2) + (i * bar_width) + (bar_width / 2)
+        scores = [auc_vals[i], aupr_vals[i]]
+
+        rects = ax.bar(x_pos, scores,
+                       width=bar_width,
+                       label=model_names[i],
+                       color=colors[i],
+                       edgecolor='white',
+                       linewidth=0.5)
+
+        # 添加数值标签
+        for rect in rects:
+            height = rect.get_height()
+            ax.text(rect.get_x() + rect.get_width() / 2, height + 0.0003,
+                    f'{height:.4f}',
+                    ha='center', va='bottom',
+                    fontsize=8,
+                    color='black')
+
+    # --- 样式设置 ---
+    ax.set_ylim(ylim_range)  # 设置Y轴范围
+
+    # 坐标轴标签
+    ax.set_xticks(x)
+    ax.set_xticklabels(group_labels, fontsize=14)  # 不加粗
+    ax.tick_params(axis='y', labelsize=10)
+
+    # 图例 (右上角，框内)
+    ax.legend(loc='upper right',
+              ncol=1,
+              fontsize=9,
+              edgecolor='#D3D3D3',
+              framealpha=0.9,
+              borderaxespad=1)
+
+    # 网格线
+    ax.yaxis.grid(True, linestyle='--', which='major', color='gray', alpha=0.3)
+    ax.set_axisbelow(True)
+
+    # 边框
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color('#333333')
+        spine.set_linewidth(0.8)
+
+    # --- 关键：在下方添加 (a)/(b) 标注 ---
+    # 已去掉 fontweight='bold'
+    ax.set_xlabel(label_text, fontsize=16, labelpad=15)
+
+
+# ==========================================
+# 3. 主绘图逻辑
 # ==========================================
 
-# --- Y轴范围设置 (关键) ---
-# 参考数据最低 0.9199，最高 0.9478
-# 设置为 0.90 ~ 0.96 可以很好地拉开差距
-plt.ylim(0.91, 0.96)
+# 创建画布：宽20，高6
+fig, axes = plt.subplots(1, 2, figsize=(20, 6), dpi=300)
 
-# --- 坐标轴标签 ---
-ax.set_xticks(x)
-ax.set_xticklabels(group_labels, fontsize=14, fontweight='bold')
-# ax.set_ylabel('Metrics', fontsize=12) # 如果需要Y轴文字可取消注释
+# --- 绘制左图 (a) MDR ---
+draw_subplot(ax=axes[0],
+             auc_vals=mdr_auc,
+             aupr_vals=mdr_aupr,
+             ylim_range=(0.915, 0.955),
+             label_text='(a) MDRdataset')
 
-# --- 图例设置 (关键：横着排) ---
-# ncol=4 表示分4列排列，这就实现了“横着排”的效果
-# frameon=True 加上边框，看起来更像论文插图
-ax.legend(loc='upper center', 
-          bbox_to_anchor=(0.5, 1.0), # 将图例放在顶部中间略偏下的位置
-          ncol=4,                    # 分4列显示 (7个变体排成2行)
-          fontsize=9, 
-          edgecolor='gray', 
-          framealpha=1)
+# --- 绘制右图 (b) MDS ---
+draw_subplot(ax=axes[1],
+             auc_vals=mds_auc,
+             aupr_vals=mds_aupr,
+             ylim_range=(0.91, 0.95),
+             label_text='(b) MDSdataset')
 
-# --- 网格线 ---
-# 参考图背景很干净，这里只加淡灰色的横线
-ax.yaxis.grid(True, linestyle='--', which='major', color='gray', alpha=0.3)
-ax.set_axisbelow(True) # 让网格线在柱子下面
-
-# --- 去掉上、右边框 ---
-ax.spines['top'].set_visible(True)  # 参考图其实保留了边框，这里设为True形成封闭框
-ax.spines['right'].set_visible(True)
-ax.spines['left'].set_visible(True)
-ax.spines['bottom'].set_visible(True)
-
-# 调整布局
+# 调整整体布局
 plt.tight_layout()
 
 # 保存图片
-plt.savefig('ablation_study_chart.png', dpi=300, bbox_inches='tight')
+plt.savefig('ablation_study_combined_final.png', dpi=300, bbox_inches='tight')
 plt.show()
+
+print("图表已生成：ablation_study_combined_final.png")

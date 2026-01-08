@@ -74,37 +74,46 @@ def get_contrast_pair_batch(batch_size, device):
 
 
 # ==========================================
-# 3. 主模型 (AttnFusionGCNNet)
+# 3. 主模型 (AttnFusionGCNNet) - ✨ 支持动态卷积核
 # ==========================================
 class AttnFusionGCNNet(torch.nn.Module):
     def __init__(self, n_output=1, n_filters=32, embed_dim=64, num_features_xd=78,
                  num_features_smile=66, num_features_xt=25, output_dim=128, dropout=0.2,
-                 contrastive_dim=128, temperature=0.1, lam=0.5):
+                 contrastive_dim=128, temperature=0.1, lam=0.5,
+                 conv_kernels=[4, 3, 2]):  # ✨ 新增参数：动态卷积核配置
         super(AttnFusionGCNNet, self).__init__()
 
         self.n_output = n_output
         self.output_dim = output_dim
         self.contrastive_dim = contrastive_dim
+        self.conv_kernels = conv_kernels  # ✨ 保存卷积核配置
         
         # Embedding 参数
         self.max_smile_idx = num_features_smile
         self.max_target_idx = num_features_xt
         self.smile_embed = nn.Embedding(num_features_smile + 1, embed_dim)
 
-        # ============ Drug Encoders (修改部分) ============
-        # ✨ 修改为与 miRNA 一致的卷积核大小: 4, 3, 2
+        # ✨ 解包动态卷积核大小
+        k1, k2, k3 = conv_kernels  # 例如: [4, 3, 2] 或 [2, 3, 4]
         
-        # CNN Branch 1: Kernel Size = 4 (原为 3)
-        self.conv_xd_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=4, padding=2)
-        self.conv_xd_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=4, padding=2)
+        # ============ Drug Encoders (使用动态卷积核) ============
+        # CNN Branch 1: 使用 k1
+        self.conv_xd_11 = nn.Conv1d(embed_dim, out_channels=n_filters, 
+                                    kernel_size=k1, padding=k1//2)
+        self.conv_xd_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, 
+                                    kernel_size=k1, padding=k1//2)
         
-        # CNN Branch 2: Kernel Size = 3 (原为 2)
-        self.conv_xd_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
-        self.conv_xd_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=3, padding=1)
+        # CNN Branch 2: 使用 k2
+        self.conv_xd_21 = nn.Conv1d(embed_dim, out_channels=n_filters, 
+                                    kernel_size=k2, padding=k2//2)
+        self.conv_xd_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, 
+                                    kernel_size=k2, padding=k2//2)
         
-        # CNN Branch 3: Kernel Size = 2 (原为 1)
-        self.conv_xd_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
-        self.conv_xd_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
+        # CNN Branch 3: 使用 k3
+        self.conv_xd_31 = nn.Conv1d(embed_dim, out_channels=n_filters, 
+                                    kernel_size=k3, padding=k3//2)
+        self.conv_xd_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, 
+                                    kernel_size=k3, padding=k3//2)
 
         self.fc_smiles = nn.Linear(n_filters * 2, output_dim)
 
@@ -133,18 +142,24 @@ class AttnFusionGCNNet(torch.nn.Module):
         self.conv_reduce_smiles = nn.Conv1d(in_channels=output_dim * 3, out_channels=output_dim, kernel_size=1)
         self.conv_reduce_xt = nn.Conv1d(in_channels=192, out_channels=output_dim, kernel_size=1)
 
-        # ============ miRNA Encoders ============
+        # ============ miRNA Encoders (使用相同的动态卷积核) ============
         self.embedding_xt = nn.Embedding(num_features_xt + 1, embed_dim)
 
-        # 1. miRNA Sequence CNNs (保持 4, 3, 2 不变)
-        self.conv_xt_11 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=4, padding=2)
-        self.conv_xt_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=4, padding=2)
+        # 1. miRNA Sequence CNNs (使用 k1, k2, k3)
+        self.conv_xt_11 = nn.Conv1d(embed_dim, out_channels=n_filters, 
+                                    kernel_size=k1, padding=k1//2)
+        self.conv_xt_12 = nn.Conv1d(n_filters, out_channels=n_filters * 2, 
+                                    kernel_size=k1, padding=k1//2)
         
-        self.conv_xt_21 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=3, padding=1)
-        self.conv_xt_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=3, padding=1)
+        self.conv_xt_21 = nn.Conv1d(embed_dim, out_channels=n_filters, 
+                                    kernel_size=k2, padding=k2//2)
+        self.conv_xt_22 = nn.Conv1d(n_filters, out_channels=n_filters * 2, 
+                                    kernel_size=k2, padding=k2//2)
         
-        self.conv_xt_31 = nn.Conv1d(embed_dim, out_channels=n_filters, kernel_size=2, padding=1)
-        self.conv_xt_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, kernel_size=2, padding=1)
+        self.conv_xt_31 = nn.Conv1d(embed_dim, out_channels=n_filters, 
+                                    kernel_size=k3, padding=k3//2)
+        self.conv_xt_32 = nn.Conv1d(n_filters, out_channels=n_filters * 2, 
+                                    kernel_size=k3, padding=k3//2)
 
         # 2. miRNA Matrix CNNs
         self.conv_matrix_1 = nn.Conv2d(1, n_filters, kernel_size=3, padding=1)
@@ -246,16 +261,16 @@ class AttnFusionGCNNet(torch.nn.Module):
 
         embedded_smile = self.smile_embed(drugsmile).permute(0, 2, 1)
         
-        # Branch 1 (Kernel 4)
+        # Branch 1 (使用 k1 卷积核)
         conv_xd1 = self.conv_xd_11(embedded_smile)
         conv_xd1 = self.relu(conv_xd1)
         conv_xd1 = self.dropout(conv_xd1)
-        conv_xd1 = F.max_pool1d(conv_xd1, kernel_size=2)  # 原代码逻辑，保留
+        conv_xd1 = F.max_pool1d(conv_xd1, kernel_size=2)
         conv_xd1 = self.conv_xd_12(conv_xd1)
         conv_xd1 = self.relu(conv_xd1)
         conv_xd1 = F.max_pool1d(conv_xd1, conv_xd1.size(2)).squeeze(2)
 
-        # Branch 2 (Kernel 3)
+        # Branch 2 (使用 k2 卷积核)
         conv_xd2 = self.conv_xd_21(embedded_smile)
         conv_xd2 = self.relu(conv_xd2)
         conv_xd2 = self.dropout(conv_xd2)
@@ -265,7 +280,7 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xd2 = self.dropout(conv_xd2)
         conv_xd2 = F.max_pool1d(conv_xd2, conv_xd2.size(2)).squeeze(2)
 
-        # Branch 3 (Kernel 2)
+        # Branch 3 (使用 k3 卷积核)
         conv_xd3 = self.conv_xd_31(embedded_smile)
         conv_xd3 = self.relu(conv_xd3)
         conv_xd3 = self.dropout(conv_xd3)
@@ -294,6 +309,8 @@ class AttnFusionGCNNet(torch.nn.Module):
 
         # ============= miRNA Processing =============
         embedded_xt = self.embedding_xt(target).permute(0, 2, 1)
+        
+        # Branch 1 (使用 k1 卷积核)
         conv_xt1 = self.conv_xt_11(embedded_xt)
         conv_xt1 = self.relu(conv_xt1)
         conv_xt1 = self.dropout(conv_xt1)
@@ -301,6 +318,7 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt1 = self.relu(conv_xt1)
         conv_xt1 = F.max_pool1d(conv_xt1, conv_xt1.size(2)).squeeze(2)
 
+        # Branch 2 (使用 k2 卷积核)
         conv_xt2 = self.conv_xt_21(embedded_xt)
         conv_xt2 = self.relu(conv_xt2)
         conv_xt2 = self.dropout(conv_xt2)
@@ -308,6 +326,7 @@ class AttnFusionGCNNet(torch.nn.Module):
         conv_xt2 = self.relu(conv_xt2)
         conv_xt2 = F.max_pool1d(conv_xt2, conv_xt2.size(2)).squeeze(2)
 
+        # Branch 3 (使用 k3 卷积核)
         conv_xt3 = self.conv_xt_31(embedded_xt)
         conv_xt3 = self.relu(conv_xt3)
         conv_xt3 = self.dropout(conv_xt3)
